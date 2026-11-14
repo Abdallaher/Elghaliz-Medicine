@@ -40,6 +40,18 @@ data class CentralDriveConfig(
 )
 
 @IgnoreExtraProperties
+data class AppUpdateInfo(
+    @DocumentId val id: String = "",
+    val latestVersionCode: Long = 1L,
+    val latestVersionName: String = "1.0",
+    val apkDriveFileId: String = "",
+    val releaseNotes: String = "",
+    @get:PropertyName("forceUpdate") @set:PropertyName("forceUpdate")
+    var forceUpdate: Boolean = false,
+    @ServerTimestamp val updatedAt: Timestamp? = null
+)
+
+@IgnoreExtraProperties
 data class AdminMember(
     @DocumentId val id: String = "",
     val userId: String = "",
@@ -72,6 +84,7 @@ data class StudentRequest(
     val displayName: String = "",
     val status: String = "pending", // "pending", "approved", "suspended"
     val scopeKey: String = "global",
+    val registeredDeviceIds: List<String> = emptyList(),
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 )

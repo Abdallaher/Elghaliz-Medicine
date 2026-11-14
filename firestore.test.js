@@ -386,7 +386,7 @@ test("Timed PDF Exams & Smart Notifications: admin creates exam and notification
   await assertSucceeds(studentDb.collection("notifications").doc("notif_exam_1").get());
 });
 
-test("Central 5TB Google Drive Vault Config (system_state/drive_config): only admins can write, approved students and admins can read", async () => {
+test("Central 5TB Google Drive Vault Config (system_state/drive_config): strictly restricted to admins for both read and write", async () => {
   await seedAdminBootstrap();
   const now = new Date();
   const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
@@ -398,8 +398,8 @@ test("Central 5TB Google Drive Vault Config (system_state/drive_config): only ad
     primaryAdminUid: ADMIN_UID,
     vaultFolderId: "1A2B3C_Elghaliz_5TB_Vault_Folder",
     vaultFolderName: "Elghaliz_Medicine_5TB_Vault",
-    accessToken: "ya29.a0AfH6SM_test_drive_token",
-    refreshToken: "1//0g_refresh_token",
+    accessToken: "",
+    refreshToken: "",
     tokenExpiresAtMillis: Date.now() + 3600000,
     isEnabled: true,
     scopeKey: "global",
@@ -421,7 +421,7 @@ test("Central 5TB Google Drive Vault Config (system_state/drive_config): only ad
   await assertFails(unauthDb.collection("system_state").doc("drive_config").get());
   await assertFails(studentDb.collection("system_state").doc("drive_config").get());
 
-  // Approve student -> can read drive_config
+  // Even an approved student cannot read drive_config (prevents token/config leakage)
   await testEnv.withSecurityRulesDisabled(async (ctx) => {
     await ctx.firestore().collection("student_requests").doc(STUDENT_UID).set({
       userId: STUDENT_UID,
@@ -429,13 +429,76 @@ test("Central 5TB Google Drive Vault Config (system_state/drive_config): only ad
       displayName: "أحمد",
       status: "approved",
       scopeKey: "global",
+      registeredDeviceIds: [],
       createdAt: now,
       updatedAt: now,
     });
   });
 
-  await assertSucceeds(studentDb.collection("system_state").doc("drive_config").get());
+  await assertFails(studentDb.collection("system_state").doc("drive_config").get());
   await assertSucceeds(adminDb.collection("system_state").doc("drive_config").get());
+
+  // Student can register the 1st device when registeredDeviceIds is initially empty
+  await assertSucceeds(
+    studentDb.collection("student_requests").doc(STUDENT_UID).update({
+      registeredDeviceIds: ["dev_1"],
+      updatedAt: new Date(),
+    })
+  );
+
+  // Once the 1st device is registered, student cannot add a 2nd device or replace the 1st device
+  await assertFails(
+    studentDb.collection("student_requests").doc(STUDENT_UID).update({
+      registeredDeviceIds: ["dev_1", "dev_2"],
+      updatedAt: new Date(),
+    })
+  );
+  await assertFails(
+    studentDb.collection("student_requests").doc(STUDENT_UID).update({
+      registeredDeviceIds: ["dev_2"],
+      updatedAt: new Date(),
+    })
+  );
+  // Updating without changing registeredDeviceIds still succeeds
+  await assertSucceeds(
+    studentDb.collection("student_requests").doc(STUDENT_UID).update({
+      registeredDeviceIds: ["dev_1"],
+      updatedAt: new Date(),
+    })
+  );
+
+  // Student cannot create or delete categories, lectures, or exams
+  await assertFails(
+    studentDb.collection("categories").doc("cat_hack").set({
+      name: "Hack",
+      description: "Unauthorized",
+      createdByUid: STUDENT_UID,
+      createdByName: "Student",
+      visibility: "published",
+      createdAt: now,
+      updatedAt: now,
+    })
+  );
+  await assertFails(studentDb.collection("lectures").doc("lec_hack").delete());
+  await assertFails(studentDb.collection("exams").doc("exam_hack").delete());
+
+  // In-App APK Auto-Updater (/system_state/app_update):
+  // Only Admin can create/update/delete app_update; signed-in students can read it
+  const appUpdatePayload = {
+    latestVersionCode: 2,
+    latestVersionName: "1.1",
+    apkDriveFileId: "1ApkDriveFileIdExample999",
+    releaseNotes: "تحسين سرعة المشغل ودعم التحديث التلقائي",
+    forceUpdate: false,
+    updatedAt: now,
+  };
+  await assertFails(studentDb.collection("system_state").doc("app_update").set(appUpdatePayload));
+  await assertSucceeds(adminDb.collection("system_state").doc("app_update").set(appUpdatePayload));
+  await assertSucceeds(studentDb.collection("system_state").doc("app_update").get());
+  await assertFails(unauthDb.collection("system_state").doc("app_update").get());
+  await assertFails(studentDb.collection("system_state").doc("app_update").delete());
 });
+
+
 
 

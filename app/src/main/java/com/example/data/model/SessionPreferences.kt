@@ -93,12 +93,56 @@ object SessionPreferences {
         prefs.edit().putString(KEY_APP_LANGUAGE, lang).apply()
     }
 
+    fun getCurrentDeviceId(context: Context): String {
+        return runCatching {
+            Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "ELG_DEV_${android.os.Build.MODEL.take(8)}"
+    }
+
+    private const val ENCRYPTED_PREFIX = "ENC1:"
+
+    private fun deriveLocalCipherKeyBytes(context: Context): ByteArray {
+        val deviceId = getCurrentDeviceId(context)
+        val seed = "ElghalizLocalPrefsCipher_v1|${context.packageName}|$deviceId"
+        return java.security.MessageDigest.getInstance("SHA-256")
+            .digest(seed.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun encryptSensitivePref(context: Context, plainText: String): String {
+        if (plainText.isBlank()) return ""
+        val keyBytes = deriveLocalCipherKeyBytes(context)
+        val inputBytes = plainText.toByteArray(Charsets.UTF_8)
+        val xored = ByteArray(inputBytes.size)
+        for (i in inputBytes.indices) {
+            val k = keyBytes[i % keyBytes.size].toInt() xor ((i * 31 + 17) and 0xFF)
+            xored[i] = (inputBytes[i].toInt() xor k).toByte()
+        }
+        val b64 = android.util.Base64.encodeToString(xored, android.util.Base64.NO_WRAP)
+        return "$ENCRYPTED_PREFIX$b64"
+    }
+
+    private fun decryptSensitivePref(context: Context, storedValue: String?): String? {
+        if (storedValue.isNullOrBlank()) return null
+        if (!storedValue.startsWith(ENCRYPTED_PREFIX)) {
+            return storedValue
+        }
+        return runCatching {
+            val b64 = storedValue.removePrefix(ENCRYPTED_PREFIX)
+            val xored = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+            val keyBytes = deriveLocalCipherKeyBytes(context)
+            val plainBytes = ByteArray(xored.size)
+            for (i in xored.indices) {
+                val k = keyBytes[i % keyBytes.size].toInt() xor ((i * 31 + 17) and 0xFF)
+                plainBytes[i] = (xored[i].toInt() xor k).toByte()
+            }
+            String(plainBytes, Charsets.UTF_8)
+        }.getOrNull()
+    }
+
     fun registerAndGetActiveDevices(context: Context, uid: String): List<String> {
         if (uid.isBlank()) return listOf("Android_Primary")
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val deviceId = runCatching {
-            Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "ELG_DEV_${android.os.Build.MODEL.take(8)}"
+        val deviceId = getCurrentDeviceId(context)
 
         val raw = prefs.getString("registered_devices_$uid", null)
         val devices = mutableListOf<String>()
@@ -113,20 +157,26 @@ object SessionPreferences {
                 }
             }
         }
-        if (!devices.contains(deviceId) && devices.size < 2) {
+        if (devices.size < 1) {
             devices.add(deviceId)
             val newArr = JSONArray()
-            devices.forEach { newArr.put(it) }
+            devices.take(1).forEach { newArr.put(it) }
             prefs.edit().putString("registered_devices_$uid", newArr.toString()).apply()
         }
-        return devices.ifEmpty { listOf(deviceId) }
+        return devices.take(1).ifEmpty { listOf(deviceId) }
+    }
+
+    fun syncRegisteredDevicesFromServer(context: Context, uid: String, serverDevices: List<String>) {
+        if (uid.isBlank()) return
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val arr = JSONArray()
+        serverDevices.distinct().take(1).forEach { arr.put(it) }
+        prefs.edit().putString("registered_devices_$uid", arr.toString()).apply()
     }
 
     fun resetRegisteredDevices(context: Context, uid: String): List<String> {
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val deviceId = runCatching {
-            Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "ELG_DEV_${android.os.Build.MODEL.take(8)}"
+        val deviceId = getCurrentDeviceId(context)
         val arr = JSONArray().apply { put(deviceId) }
         prefs.edit().putString("registered_devices_$uid", arr.toString()).apply()
         return listOf(deviceId)
@@ -155,6 +205,15 @@ object SessionPreferences {
         }
         editor.apply()
         return isNowCompleted
+    }
+
+    fun markLectureCompleted(context: Context, lectureId: String) {
+        if (lectureId.isBlank()) return
+        val prefs = context.applicationContext.getSharedPreferences(PLAYBACK_POSITIONS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putInt("pos_$lectureId", 0)
+            .putBoolean("completed_$lectureId", true)
+            .apply()
     }
 
     fun getAllPlaybackPositionsAndCompletions(context: Context): Pair<Map<String, Int>, Set<String>> {
@@ -319,16 +378,18 @@ object SessionPreferences {
             put("approvalStatus", approvalStatus)
             put("updatedAt", System.currentTimeMillis())
         }
+        val encryptedPayload = encryptSensitivePref(context, json.toString())
         prefs.edit()
-            .putString("verified_account_$uid", json.toString())
+            .putString("verified_account_$uid", encryptedPayload)
             .apply()
     }
 
     fun saveLastKnownDriveToken(context: Context, token: String, folderId: String = "") {
         if (token.isBlank()) return
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val encryptedToken = encryptSensitivePref(context, token.trim())
         prefs.edit()
-            .putString("last_known_drive_token", token.trim())
+            .putString("last_known_drive_token", encryptedToken)
             .putString("last_known_drive_folder_id", folderId.trim())
             .putLong("last_known_drive_token_timestamp", System.currentTimeMillis())
             .apply()
@@ -336,7 +397,8 @@ object SessionPreferences {
 
     fun getLastKnownDriveToken(context: Context): String? {
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getString("last_known_drive_token", null)?.takeIf { it.isNotBlank() }
+        val raw = prefs.getString("last_known_drive_token", null) ?: return null
+        return decryptSensitivePref(context, raw)?.takeIf { it.isNotBlank() }
     }
 
     fun getVerifiedAccountState(
@@ -347,8 +409,9 @@ object SessionPreferences {
         if (uid.isBlank()) return null
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString("verified_account_$uid", null) ?: return null
+        val decryptedJson = decryptSensitivePref(context, raw) ?: return null
         return runCatching {
-            val json = JSONObject(raw)
+            val json = JSONObject(decryptedJson)
             val savedUid = json.optString("uid", "")
             val savedEmail = json.optString("email", "")
             val cleanEmail = email.trim().lowercase()
@@ -480,7 +543,6 @@ object SessionPreferences {
     }
 
     fun saveLocalLecturesCache(context: Context, lectures: List<Lecture>) {
-        if (lectures.isEmpty()) return
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val arr = JSONArray()
         lectures.forEach { lec ->

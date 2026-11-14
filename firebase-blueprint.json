@@ -198,6 +198,10 @@
           "enum": ["global"],
           "description": "Scope key for admin list queries."
         },
+        "registeredDeviceIds": {
+          "type": "array",
+          "description": "Server-enforced list of registered device IDs (max 2 devices per student account)."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

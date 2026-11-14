@@ -36,7 +36,11 @@ service cloud.firestore {
     function isAdmin() {
       return isSignedIn() && (
         isBootstrappedAdminEmail() ||
-        exists(/databases/$(database)/documents/admin_members/$(request.auth.uid))
+        exists(/databases/$(database)/documents/admin_members/$(request.auth.uid)) ||
+        (
+          exists(/databases/$(database)/documents/system_state/config) &&
+          get(/databases/$(database)/documents/system_state/config).data.primaryAdminUid == request.auth.uid
+        )
       );
     }
 
@@ -60,31 +64,63 @@ service cloud.firestore {
 
     // 1. System State (Bootstrap & Central 5TB Google Drive Config)
     match /system_state/{configId} {
-      allow get: if isSignedIn() && (
-        configId != 'drive_config' ||
-        isApprovedStudentOrAdmin()
+      allow read: if isSignedIn() && (
+        (configId == 'drive_config' && isAdmin()) ||
+        (configId == 'app_update') ||
+        (configId != 'drive_config')
       );
-      allow list: if isSignedIn() && isAdmin();
 
       allow create, update: if isSignedIn() && (
-        configId != 'drive_config' ||
-        isAdmin()
+        ((configId == 'drive_config' || configId == 'app_update') && isAdmin()) ||
+        (
+          configId != 'drive_config' &&
+          configId != 'app_update' &&
+          (isAdmin() || !exists(/databases/$(database)/documents/system_state/config))
+        )
       );
 
-      allow delete: if isSignedIn() && isAdmin();
+      allow delete: if isAdmin();
     }
 
-    // 2. Admin Members (Open to signed-in users so admin bootstrap & lecture upload never fail with PERMISSION_DENIED)
+    // 2. Admin Members
     match /admin_members/{userId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          request.auth.uid == userId &&
+          (
+            isBootstrappedAdminEmail() ||
+            (
+              'emailHash' in incoming() &&
+              exists(/databases/$(database)/documents/system_state/config) &&
+              incoming().emailHash in get(/databases/$(database)/documents/system_state/config).data.adminEmailHashes
+            )
+          )
+        )
+      );
+      allow delete: if isAdmin();
     }
 
     // 3. Admins Directory
     match /admins/{adminId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 4. Student Join Requests & Approval Status
+    function isValidOneDeviceLockOnUpdate() {
+      return (
+        (!('registeredDeviceIds' in existing()) || existing().registeredDeviceIds.size() == 0) &&
+        (!('registeredDeviceIds' in incoming()) || (incoming().registeredDeviceIds is list && incoming().registeredDeviceIds.size() <= 1))
+      ) || (
+        ('registeredDeviceIds' in existing()) &&
+        existing().registeredDeviceIds.size() >= 1 &&
+        ('registeredDeviceIds' in incoming()) &&
+        incoming().registeredDeviceIds == existing().registeredDeviceIds
+      );
+    }
+
+    // 4. Student Join Requests, Approval Status & Strict Permanent 1-Device Lock
     match /student_requests/{studentId} {
       allow get: if isSignedIn() && (request.auth.uid == studentId || isAdmin());
       allow list: if isSignedIn();
@@ -92,17 +128,23 @@ service cloud.firestore {
       allow create: if isSignedIn() &&
                        request.auth.uid == studentId &&
                        incoming().userId == request.auth.uid &&
-                       (incoming().status == 'pending' || isAdmin());
+                       (incoming().status == 'pending' || isAdmin()) &&
+                       (
+                         !('registeredDeviceIds' in incoming()) ||
+                         (incoming().registeredDeviceIds is list && incoming().registeredDeviceIds.size() <= 1)
+                       );
 
-      allow update: if isSignedIn() && (
-        isAdmin() ||
-        (
-          request.auth.uid == studentId &&
-          incoming().status == existing().status
-        )
-      );
+      allow update: if isSignedIn() &&
+                       isValidOneDeviceLockOnUpdate() &&
+                       (
+                         isAdmin() ||
+                         (
+                           request.auth.uid == studentId &&
+                           incoming().status == existing().status
+                         )
+                       );
 
-      allow delete: if isSignedIn() && isAdmin();
+      allow delete: if isAdmin();
     }
 
     // 4b. Per-Category (Course) Enrollment Requests & Approvals (/course_requests/{requestId})
@@ -124,34 +166,38 @@ service cloud.firestore {
         isAdmin()
       );
 
-      allow update: if isSignedIn() && isAdmin();
+      allow update: if isAdmin();
 
-      allow delete: if isSignedIn() && isAdmin();
+      allow delete: if isAdmin();
     }
 
-    // 5. Academic Medical Categories (No PERMISSION_DENIED on category creation/update)
+    // 5. Academic Medical Categories
     match /categories/{categoryId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 6. Video Lectures & Chunks (No PERMISSION_DENIED at 95% when saving Google Drive lecture metadata)
+    // 6. Video Lectures & Chunks
     match /lectures/{lectureId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
 
       match /video_chunks/{chunkId} {
-        allow read, write: if isSignedIn();
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin();
       }
     }
 
     // 7. Native Built-in Live Meetings
     match /meetings/{meetingId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
 
       // 8. Native In-Room Live Chat & Questions Subcollection
       match /messages/{messageId} {
         allow get, list: if isSignedIn() && isApprovedStudentOrAdmin();
         allow create, update: if isSignedIn() && isApprovedStudentOrAdmin();
-        allow delete: if isSignedIn() && isAdmin();
+        allow delete: if isAdmin();
       }
     }
 
@@ -164,19 +210,21 @@ service cloud.firestore {
 
     // 10. Course Timed PDF Exams & PDF Chunks
     match /exams/{examId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
 
       match /pdf_chunks/{chunkId} {
-        allow get, list: if isSignedIn() &&
-                            exists(/databases/$(database)/documents/exams/$(examId)) &&
-                            isEnrolledInCategory(get(/databases/$(database)/documents/exams/$(examId)).data.categoryId);
-        allow create, update, delete: if isSignedIn();
+        allow read: if isSignedIn() &&
+                       exists(/databases/$(database)/documents/exams/$(examId)) &&
+                       isEnrolledInCategory(get(/databases/$(database)/documents/exams/$(examId)).data.categoryId);
+        allow create, update, delete: if isAdmin();
       }
     }
 
     // 11. Smart Course Notifications
     match /notifications/{notificationId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
     }
   }
 }

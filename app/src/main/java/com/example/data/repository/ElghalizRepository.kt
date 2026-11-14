@@ -5,6 +5,7 @@ import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import com.example.data.model.AdminEntry
+import com.example.data.model.AppUpdateInfo
 import com.example.data.model.Category
 import com.example.data.model.CentralDriveConfig
 import com.example.data.model.CourseNotification
@@ -72,6 +73,24 @@ class ElghalizRepository(
     private fun requireUserId(): String =
         auth.currentUser?.uid ?: throw IllegalStateException("يجب تسجيل الدخول أولاً")
 
+    @Volatile
+    private var inMemoryDriveToken: String = ""
+
+    private fun maskEmail(rawEmail: String?): String {
+        if (rawEmail.isNullOrBlank()) return "redacted"
+        val clean = rawEmail.trim()
+        val atIdx = clean.indexOf('@')
+        if (atIdx <= 0) return "${clean.take(2)}***"
+        val local = clean.substring(0, atIdx)
+        val domain = clean.substring(atIdx)
+        return "${local.take(2).ifEmpty { "*" }}***$domain"
+    }
+
+    private fun maskUid(rawUid: String?): String {
+        if (rawUid.isNullOrBlank()) return "redacted"
+        return "${rawUid.trim().take(4)}***"
+    }
+
     private fun handleFirestoreError(
         error: Exception,
         operationType: OperationType,
@@ -81,15 +100,14 @@ class ElghalizRepository(
         val providerInfo = JSONObject().apply {
             currentUser?.providerData?.forEach { userInfo ->
                 put(userInfo.providerId, JSONObject().apply {
-                    put("uid", userInfo.uid)
-                    put("DisplayName", userInfo.displayName)
-                    put("email", userInfo.email)
+                    put("uid", maskUid(userInfo.uid))
+                    put("email", maskEmail(userInfo.email))
                 })
             }
         }
         val authInfo = JSONObject().apply {
-            put("userId", currentUser?.uid)
-            put("email", currentUser?.email)
+            put("userId", maskUid(currentUser?.uid))
+            put("email", maskEmail(currentUser?.email))
             put("emailVerified", currentUser?.isEmailVerified)
             put("isAnonymous", currentUser?.isAnonymous)
             put("providerInfo", providerInfo)
@@ -100,7 +118,7 @@ class ElghalizRepository(
             put("path", path)
             put("authInfo", authInfo)
         }
-        Log.e("FirestoreError", errInfo.toString(), error)
+        Log.e("FirestoreError", errInfo.toString())
     }
 
     private suspend fun getDocumentWithOfflineCacheFallback(docRef: DocumentReference): DocumentSnapshot {
@@ -441,6 +459,130 @@ class ElghalizRepository(
     }
 
     /**
+     * يراقب وثيقة التحديث التلقائي للتطبيق (`/system_state/app_update`) لجميع المستخدمين المسجلين.
+     */
+    fun observeAppUpdateInfo(): Flow<AppUpdateInfo?> {
+        val docRef = db.collection("system_state").document("app_update")
+        val uidAtStart = auth.currentUser?.uid
+        return docRef.snapshots()
+            .map { snapshot ->
+                if (snapshot.exists()) {
+                    snapshot.toObject(
+                        AppUpdateInfo::class.java,
+                        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                    )
+                } else {
+                    null
+                }
+            }
+            .catch { error ->
+                val firestoreError = generateSequence(error) { it.cause }
+                    .filterIsInstance<FirebaseFirestoreException>()
+                    .firstOrNull()
+                if (firestoreError == null && error is CancellationException) throw error
+                val exceptionToLog = firestoreError ?: (error as? Exception)
+                if (exceptionToLog != null && uidAtStart != null && auth.currentUser?.uid == uidAtStart) {
+                    handleFirestoreError(exceptionToLog, OperationType.GET, docRef.path)
+                }
+                emit(null)
+            }
+    }
+
+    /**
+     * يرفع ملف التحديث `.apk` إلى مجلد `Elghaliz_Medicine_Lectures` في مخزن 5TB Google Drive
+     * ويفعّل مشاركته عبر `makeDriveFilePublicViaAppsScript` ثم يحفظ بيانات الإصدار في `/system_state/app_update`.
+     */
+    suspend fun publishAppUpdateApk(
+        apkSourceUri: String,
+        latestVersionCode: Long,
+        latestVersionName: String,
+        releaseNotes: String,
+        forceUpdate: Boolean,
+        onProgress: (Int) -> Unit = {}
+    ): Result<AppUpdateInfo> = withContext(Dispatchers.IO) {
+        runCatching {
+            requireUserId()
+            require(latestVersionCode >= 1L) { "يرجى إدخال رقم إصدار صحيح (Version Code >= 1)" }
+            val cleanVersionName = latestVersionName.trim().ifBlank { "1.$latestVersionCode" }
+            val cleanNotes = releaseNotes.trim().ifBlank {
+                "تحديث جديد لتحسين سرعة مشغل المحاضرات والأداء العام"
+            }
+
+            val trimmedUri = apkSourceUri.trim()
+            require(trimmedUri.isNotBlank()) { "يرجى اختيار ملف التحديث (.apk) من الهاتف أولاً" }
+
+            onProgress(5)
+            val preExtractedDriveId = GoogleDrive5TbVaultManager.extractDriveFileId(trimmedUri)
+            val resolvedDriveFileId = if (!preExtractedDriveId.isNullOrBlank()) {
+                GoogleDrive5TbVaultManager.makeDriveFilePublicViaAppsScript(preExtractedDriveId)
+                onProgress(95)
+                preExtractedDriveId
+            } else {
+                val localFallback = GoogleDrive5TbVaultManager.resolveLocalFileFromUriString(trimmedUri)
+                val uploadedMeta = GoogleDrive5TbVaultManager.uploadApkFileResumableTo5TbVault(
+                    context = appContext,
+                    apkSourceUri = trimmedUri,
+                    fallbackFile = localFallback,
+                    versionCode = latestVersionCode,
+                    versionName = cleanVersionName,
+                    accessToken = inMemoryDriveToken.ifBlank {
+                        GoogleDrive5TbVaultManager.getInstantAccessTokenOrNull().orEmpty()
+                    },
+                    onProgress = { pct ->
+                        onProgress(pct.coerceIn(5, 95))
+                    }
+                ).getOrThrow()
+                uploadedMeta.driveFileId
+            }
+
+            val updateDocRef = db.collection("system_state").document("app_update")
+            val payload = mapOf(
+                "latestVersionCode" to latestVersionCode,
+                "latestVersionName" to cleanVersionName,
+                "apkDriveFileId" to resolvedDriveFileId,
+                "releaseNotes" to cleanNotes,
+                "forceUpdate" to forceUpdate,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            try {
+                updateDocRef.set(payload).await()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.WRITE, updateDocRef.path)
+                throw e
+            }
+
+            onProgress(100)
+            AppUpdateInfo(
+                id = "app_update",
+                latestVersionCode = latestVersionCode,
+                latestVersionName = cleanVersionName,
+                apkDriveFileId = resolvedDriveFileId,
+                releaseNotes = cleanNotes,
+                forceUpdate = forceUpdate
+            )
+        }
+    }
+
+    /**
+     * يحمّل ملف التحديث `.apk` من مخزن Google Drive إلى `File(context.cacheDir, "app_updates/ElghalizUpdate.apk")`.
+     */
+    suspend fun downloadAppUpdateApkToCache(
+        apkDriveFileId: String,
+        onProgress: (Int) -> Unit = {}
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val ctx = appContext ?: return@withContext Result.failure(
+            IllegalStateException("سياق التطبيق غير متوفر لتنزيل التحديث")
+        )
+        GoogleDrive5TbVaultManager.downloadApkFromDriveToCacheFile(
+            context = ctx,
+            apkDriveFileId = apkDriveFileId,
+            onProgress = onProgress
+        )
+    }
+
+    /**
      * يقوم بتفعيل وتحديث الاتصال بمخزن الـ 5 تيرابايت (Google Drive) تلقائياً وصامتاً 100% في الخلفية
      * عند تشغيل التطبيق دون أي أزرار أو إشعارات أو نصوص أمام المستخدم أو المدير.
      */
@@ -448,6 +590,13 @@ class ElghalizRepository(
         if (android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)) return@withContext
         val params = GoogleDrive5TbVaultManager.warmUpCentralVaultSilently() ?: return@withContext
         val uid = auth.currentUser?.uid ?: return@withContext
+        if (params.accessToken.isNotBlank()) {
+            inMemoryDriveToken = params.accessToken
+            GoogleDrive5TbVaultManager.seedCachedTokenIfEmpty(params.accessToken)
+            if (appContext != null) {
+                SessionPreferences.saveLastKnownDriveToken(appContext, params.accessToken, params.folderId)
+            }
+        }
         if (!isAdmin || params.accessToken.isBlank()) return@withContext
 
         runCatching {
@@ -458,8 +607,8 @@ class ElghalizRepository(
                 "primaryAdminUid" to uid,
                 "vaultFolderId" to params.folderId.ifBlank { GoogleDrive5TbVaultManager.LECTURES_FOLDER_NAME }.take(200),
                 "vaultFolderName" to GoogleDrive5TbVaultManager.VAULT_FOLDER_NAME,
-                "accessToken" to params.accessToken.take(4000),
-                "refreshToken" to "apps_script_central_vault",
+                "accessToken" to "",
+                "refreshToken" to "",
                 "tokenExpiresAtMillis" to (System.currentTimeMillis() + 3_500_000L),
                 "isEnabled" to true,
                 "scopeKey" to "global",
@@ -485,10 +634,18 @@ class ElghalizRepository(
             throw e
         }
         if (snap.exists()) {
-            snap.toObject(
+            val parsed = snap.toObject(
                 CentralDriveConfig::class.java,
                 DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
             )
+            val cachedToken = inMemoryDriveToken.takeIf { it.isNotBlank() }
+                ?: GoogleDrive5TbVaultManager.getInstantAccessTokenOrNull().orEmpty()
+                .ifBlank { appContext?.let { SessionPreferences.getLastKnownDriveToken(it) }.orEmpty() }
+            if (parsed != null && parsed.accessToken.isBlank() && cachedToken.isNotBlank()) {
+                parsed.copy(accessToken = cachedToken)
+            } else {
+                parsed
+            }
         } else {
             null
         }
@@ -496,7 +653,8 @@ class ElghalizRepository(
 
     /**
      * تفعيل مخزن المنصة المركزي (5TB Google Drive) بضغطة زر واحدة من داخل التطبيق للمدير الرئيسي
-     * يقوم بإنشاء مجلد Elghaliz_Medicine_5TB_Vault تلقائياً وحفظ تصريح الرفع المركزي في system_state/drive_config.
+     * يقوم بإنشاء مجلد Elghaliz_Medicine_5TB_Vault تلقائياً وحفظ معرف المجلد وحالة التفعيل فقط في system_state/drive_config
+     * مع إبقاء التوكن في الذاكرة والكاش المشفر فقط دون تخزينه كنص صريح في Firestore.
      */
     suspend fun activateCentral5TbDriveVault(
         accessToken: String,
@@ -508,6 +666,9 @@ class ElghalizRepository(
         val cleanToken = accessToken.trim()
         require(cleanToken.isNotBlank()) { "تعذر الحصول على رمز التصريح من حساب Google Drive" }
 
+        inMemoryDriveToken = cleanToken
+        GoogleDrive5TbVaultManager.seedCachedTokenIfEmpty(cleanToken)
+
         val folderId = if (!overrideFolderId.isNullOrBlank()) {
             overrideFolderId.trim()
         } else {
@@ -516,19 +677,20 @@ class ElghalizRepository(
             }
         }
 
+        if (appContext != null) {
+            SessionPreferences.saveLastKnownDriveToken(appContext, cleanToken, folderId)
+        }
+
         val docRef = db.collection("system_state").document("drive_config")
         val existingSnap = runCatching { docRef.get().await() }.getOrNull()
-        val cleanRefresh = refreshToken.trim().ifBlank {
-            existingSnap?.getString("refreshToken") ?: "auto_android_identity_sync"
-        }
 
         val payload = mutableMapOf<String, Any>(
             "primaryAdminEmail" to GoogleDrive5TbVaultManager.PRIMARY_ADMIN_EMAIL,
             "primaryAdminUid" to uid,
             "vaultFolderId" to folderId.take(200),
             "vaultFolderName" to GoogleDrive5TbVaultManager.VAULT_FOLDER_NAME,
-            "accessToken" to cleanToken.take(4000),
-            "refreshToken" to cleanRefresh.take(4000),
+            "accessToken" to "",
+            "refreshToken" to "",
             "tokenExpiresAtMillis" to tokenExpiresAtMillis.coerceAtLeast(1L),
             "isEnabled" to true,
             "scopeKey" to "global",
@@ -561,7 +723,7 @@ class ElghalizRepository(
             vaultFolderId = folderId,
             vaultFolderName = GoogleDrive5TbVaultManager.VAULT_FOLDER_NAME,
             accessToken = cleanToken,
-            refreshToken = cleanRefresh,
+            refreshToken = "",
             tokenExpiresAtMillis = tokenExpiresAtMillis,
             isEnabled = true,
             scopeKey = "global"
@@ -569,30 +731,46 @@ class ElghalizRepository(
     }
 
     /**
-     * يجلب تصريح مخزن الـ 5 تيرابايت المحفوظ في الخلفية تلقائياً (system_state/drive_config)
-     * مع تجديد التصريح صامتاً إذا كان الجهاز الحالي قادرًا على تحديثه دون تدخل يدوي.
+     * يجلب إعدادات مخزن الـ 5 تيرابايت المحفوظة مع استخدام التوكن من الذاكرة/الكاش المشفر فقط.
      */
     suspend fun resolveValidDriveConfig(): CentralDriveConfig? {
-        val currentConfig = getCentralDriveConfig().getOrNull() ?: return null
-        if (!currentConfig.isEnabled || currentConfig.accessToken.isBlank()) return null
+        val currentConfig = runCatching { getCentralDriveConfig().getOrNull() }.getOrNull()
+        val memoryOrCachedToken = inMemoryDriveToken.takeIf { it.isNotBlank() }
+            ?: GoogleDrive5TbVaultManager.getInstantAccessTokenOrNull().orEmpty()
+                .ifBlank { appContext?.let { SessionPreferences.getLastKnownDriveToken(it) }.orEmpty() }
+
+        val effectiveConfig = when {
+            currentConfig != null && currentConfig.accessToken.isBlank() && memoryOrCachedToken.isNotBlank() ->
+                currentConfig.copy(accessToken = memoryOrCachedToken)
+            currentConfig != null -> currentConfig
+            memoryOrCachedToken.isNotBlank() -> CentralDriveConfig(
+                id = "drive_config",
+                vaultFolderId = GoogleDrive5TbVaultManager.LECTURES_FOLDER_NAME,
+                vaultFolderName = GoogleDrive5TbVaultManager.VAULT_FOLDER_NAME,
+                accessToken = memoryOrCachedToken,
+                tokenExpiresAtMillis = System.currentTimeMillis() + 3_500_000L,
+                isEnabled = true
+            )
+            else -> null
+        } ?: return null
+
+        if (!effectiveConfig.isEnabled || effectiveConfig.accessToken.isBlank()) return null
 
         val now = System.currentTimeMillis()
-        val isExpiringSoon = currentConfig.tokenExpiresAtMillis in 1L..(now + 5 * 60 * 1000L)
+        val isExpiringSoon = effectiveConfig.tokenExpiresAtMillis in 1L..(now + 5 * 60 * 1000L)
         if (isExpiringSoon) {
             val scriptParams = GoogleDrive5TbVaultManager.fetchUploadParamsFromAppsScript().getOrNull()
             if (scriptParams != null && scriptParams.accessToken.isNotBlank()) {
                 val expiresAt = now + 3_500_000L
-                runCatching {
-                    val docRef = db.collection("system_state").document("drive_config")
-                    docRef.update(
-                        mapOf(
-                            "accessToken" to scriptParams.accessToken.take(4000),
-                            "tokenExpiresAtMillis" to expiresAt,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ).await()
+                inMemoryDriveToken = scriptParams.accessToken
+                if (appContext != null) {
+                    SessionPreferences.saveLastKnownDriveToken(
+                        appContext,
+                        scriptParams.accessToken,
+                        scriptParams.folderId
+                    )
                 }
-                return currentConfig.copy(
+                return effectiveConfig.copy(
                     accessToken = scriptParams.accessToken,
                     tokenExpiresAtMillis = expiresAt
                 )
@@ -600,27 +778,23 @@ class ElghalizRepository(
             if (appContext != null) {
                 val refreshed = GoogleDrive5TbVaultManager.trySilentTokenRefreshOnDevice(
                     context = appContext,
-                    primaryAdminEmail = currentConfig.primaryAdminEmail
+                    primaryAdminEmail = effectiveConfig.primaryAdminEmail
                 )
                 if (refreshed != null && refreshed.accessToken.isNotBlank()) {
-                    runCatching {
-                        val docRef = db.collection("system_state").document("drive_config")
-                        docRef.update(
-                            mapOf(
-                                "accessToken" to refreshed.accessToken.take(4000),
-                                "tokenExpiresAtMillis" to refreshed.expiresAtMillis,
-                                "updatedAt" to FieldValue.serverTimestamp()
-                            )
-                        ).await()
-                    }
-                    return currentConfig.copy(
+                    inMemoryDriveToken = refreshed.accessToken
+                    SessionPreferences.saveLastKnownDriveToken(
+                        appContext,
+                        refreshed.accessToken,
+                        effectiveConfig.vaultFolderId
+                    )
+                    return effectiveConfig.copy(
                         accessToken = refreshed.accessToken,
                         tokenExpiresAtMillis = refreshed.expiresAtMillis
                     )
                 }
             }
         }
-        return currentConfig
+        return effectiveConfig
     }
 
     /**
@@ -662,13 +836,16 @@ class ElghalizRepository(
      */
     suspend fun ensureStudentRequestRegistered(
         rawEmail: String,
-        rawDisplayName: String
+        rawDisplayName: String,
+        currentDeviceId: String? = null
     ): Result<StudentRequest> = runCatching {
         val uid = requireUserId()
         val cleanEmail = rawEmail.trim().lowercase().ifBlank { "student_${uid.take(6)}@elghaliz.med" }.take(150)
         val cleanName = rawDisplayName.trim().ifBlank {
             cleanEmail.substringBefore("@").ifBlank { "طالب طب" }
         }.take(100)
+        val effectiveDeviceId = currentDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: appContext?.let { SessionPreferences.getCurrentDeviceId(it) }.orEmpty()
 
         val docRef = db.collection("student_requests").document(uid)
         val existingSnap = try {
@@ -686,16 +863,31 @@ class ElghalizRepository(
                 DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
             )
             if (parsed != null) {
+                val currentDevices = parsed.registeredDeviceIds.filter { it.isNotBlank() }.distinct()
+                if (effectiveDeviceId.isNotBlank() && currentDevices.isEmpty()) {
+                    val updatedDevices = listOf(effectiveDeviceId)
+                    runCatching {
+                        docRef.update(
+                            mapOf(
+                                "registeredDeviceIds" to updatedDevices,
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        ).await()
+                    }
+                    return@runCatching parsed.copy(registeredDeviceIds = updatedDevices)
+                }
                 return@runCatching parsed
             }
         }
 
+        val initialDevices = if (effectiveDeviceId.isNotBlank()) listOf(effectiveDeviceId) else emptyList()
         val payload = mapOf(
             "userId" to uid,
             "email" to cleanEmail,
             "displayName" to cleanName,
             "status" to "pending",
             "scopeKey" to "global",
+            "registeredDeviceIds" to initialDevices,
             "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp()
         )
@@ -714,8 +906,84 @@ class ElghalizRepository(
             email = cleanEmail,
             displayName = cleanName,
             status = "pending",
-            scopeKey = "global"
+            scopeKey = "global",
+            registeredDeviceIds = initialDevices
         )
+    }
+
+    /**
+     * يتحقق من قفل الجهاز الواحد الدائم لكل إيميل (Strict Permanent 1-Device Lock per Email) في Firestore /student_requests/{uid}.
+     * إذا كانت القائمة فارغة يسجل الجهاز الأول ويُرجع true؛ وإذا كانت تحتوي على الجهاز الحالي يُرجع true؛
+     * أما إذا كانت تحتوي على جهاز آخر فيُرجع false فوراً دون تعديل القائمة.
+     */
+    suspend fun verifyOrRegisterStudentDevice(deviceId: String): Result<Pair<Boolean, List<String>>> = runCatching {
+        val uid = requireUserId()
+        val cleanDeviceId = deviceId.trim().ifBlank {
+            appContext?.let { SessionPreferences.getCurrentDeviceId(it) } ?: "Android_Primary"
+        }
+        val docRef = db.collection("student_requests").document(uid)
+        val snap = getDocumentWithOfflineCacheFallback(docRef)
+        if (!snap.exists()) {
+            return@runCatching true to listOf(cleanDeviceId)
+        }
+        val parsed = snap.toObject(
+            StudentRequest::class.java,
+            DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        )
+        val existingDevices = parsed?.registeredDeviceIds?.filter { it.isNotBlank() }?.distinct() ?: emptyList()
+        if (existingDevices.isEmpty()) {
+            val firstDeviceList = listOf(cleanDeviceId)
+            try {
+                docRef.update(
+                    mapOf(
+                        "registeredDeviceIds" to firstDeviceList,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+                throw e
+            }
+            return@runCatching true to firstDeviceList
+        }
+        if (existingDevices.contains(cleanDeviceId)) {
+            return@runCatching true to existingDevices.take(1)
+        }
+        false to existingDevices
+    }
+
+    /**
+     * يصفر قائمة الأجهزة المرتبطة في Firestore (/student_requests/{uid}) لتقتصر على الجهاز الحالي فقط.
+     */
+    suspend fun resetStudentRegisteredDevices(currentDeviceId: String): Result<List<String>> = runCatching {
+        val uid = requireUserId()
+        val cleanDeviceId = currentDeviceId.trim().ifBlank {
+            appContext?.let { SessionPreferences.getCurrentDeviceId(it) } ?: "Android_Primary"
+        }
+        val singleDeviceList = listOf(cleanDeviceId)
+        val docRef = db.collection("student_requests").document(uid)
+        val snap = runCatching { docRef.get().await() }.getOrNull()
+        if (snap != null && snap.exists()) {
+            try {
+                docRef.update(
+                    mapOf(
+                        "registeredDeviceIds" to singleDeviceList,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+                throw e
+            }
+        }
+        if (appContext != null) {
+            SessionPreferences.syncRegisteredDevicesFromServer(appContext, uid, singleDeviceList)
+        }
+        singleDeviceList
     }
 
     fun observeMyStudentRequest(userId: String): Flow<StudentRequest?> {
@@ -1511,7 +1779,11 @@ class ElghalizRepository(
                 ?.takeIf { it.isNotBlank() }
                 ?: savedDriveConfig?.vaultFolderId.orEmpty()
 
-            // حفظ التصريح المجلوب في الخلفية داخل system_state/drive_config بشكل غير معطّل
+            // حفظ معرف المجلد وحالة التفعيل فقط في الخلفية داخل system_state/drive_config دون حفظ التوكن الحي في Firestore
+            inMemoryDriveToken = cloudAccessToken
+            if (appContext != null) {
+                SessionPreferences.saveLastKnownDriveToken(appContext, cloudAccessToken, cloudFolderId)
+            }
             runCatching {
                 val driveDocRef = db.collection("system_state").document("drive_config")
                 val driveSnap = driveDocRef.get().await()
@@ -1520,8 +1792,8 @@ class ElghalizRepository(
                     "primaryAdminUid" to uid,
                     "vaultFolderId" to cloudFolderId.ifBlank { GoogleDrive5TbVaultManager.LECTURES_FOLDER_NAME }.take(200),
                     "vaultFolderName" to GoogleDrive5TbVaultManager.VAULT_FOLDER_NAME,
-                    "accessToken" to cloudAccessToken.take(4000),
-                    "refreshToken" to "apps_script_central_vault",
+                    "accessToken" to "",
+                    "refreshToken" to "",
                     "tokenExpiresAtMillis" to (System.currentTimeMillis() + 3_500_000L),
                     "isEnabled" to true,
                     "scopeKey" to "global",
@@ -1822,9 +2094,16 @@ class ElghalizRepository(
         // يتم بثه وتشفيره بـ AES-256 داخل خزنة التطبيق لمنع تسريبه ثم فك تشفيره للتشغيل الداخلي
         val driveFileId = GoogleDrive5TbVaultManager.extractDriveFileId(lecture.videoSourceUri)
         if (!driveFileId.isNullOrBlank()) {
-            val driveToken = GoogleDrive5TbVaultManager.fetchUploadParamsFromAppsScript().getOrNull()?.accessToken
-                ?.takeIf { it.isNotBlank() }
-                ?: resolveValidDriveConfig()?.accessToken.orEmpty()
+            val instantToken = (GoogleDrive5TbVaultManager.getInstantAccessTokenOrNull()
+                ?: appContext?.let { SessionPreferences.getLastKnownDriveToken(it) }
+                ?: inMemoryDriveToken).trim()
+            val driveToken = if (instantToken.isNotBlank()) {
+                instantToken
+            } else {
+                GoogleDrive5TbVaultManager.fetchUploadParamsFromAppsScript().getOrNull()?.accessToken
+                    ?.takeIf { it.isNotBlank() }
+                    ?: resolveValidDriveConfig()?.accessToken.orEmpty()
+            }
 
             if (!vaultDir.exists()) vaultDir.mkdirs()
             val encryptedVaultFile = GoogleDrive5TbVaultManager.downloadAndEncryptRangeStreamToVault(
@@ -1851,7 +2130,7 @@ class ElghalizRepository(
     }
 
     suspend fun deleteLecture(lectureId: String): Result<Unit> = runCatching {
-        requireUserId()
+        val uid = requireUserId()
         val docRef = db.collection("lectures").document(lectureId)
         try {
             docRef.delete().await()
@@ -1860,6 +2139,47 @@ class ElghalizRepository(
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.DELETE, docRef.path)
             throw e
+        }
+
+        // تنظيف جميع الملفات المحلية المرتبطة بالمحاضرة في offline_vault و uploaded_videos و stream_cache
+        withContext(Dispatchers.IO) {
+            val rootParent = internalStorageRoot?.parentFile
+                ?: appContext?.filesDir
+                ?: File(System.getProperty("java.io.tmpdir", "/tmp"))
+            val vaultDir = internalStorageRoot ?: File(appContext?.filesDir ?: rootParent, "offline_vault")
+            val legacyVaultDir = File(rootParent, "offline_vault_$uid")
+            val uploadedDir = File(rootParent, "uploaded_videos")
+            val streamCacheDir = File(rootParent, "stream_cache")
+            val sharedVaultMirrorDir = File(System.getProperty("java.io.tmpdir", "/tmp"), "elghaliz_5tb_vault_mirror")
+
+            val filesToDelete = listOf(
+                File(vaultDir, "$lectureId.elgdrm"),
+                File(vaultDir, "$lectureId.mp4"),
+                File(vaultDir, "$lectureId.medvid"),
+                GoogleDrive5TbVaultManager.getDownloadPartFile(vaultDir, lectureId),
+                GoogleDrive5TbVaultManager.getDownloadTotalBytesMetaFile(vaultDir, lectureId),
+                File(legacyVaultDir, "$lectureId.elgdrm"),
+                File(legacyVaultDir, "$lectureId.mp4"),
+                File(uploadedDir, "$lectureId.mp4"),
+                File(streamCacheDir, "$lectureId.mp4"),
+                File(sharedVaultMirrorDir, "$lectureId.mp4")
+            )
+            for (f in filesToDelete) {
+                runCatching { if (f.exists()) f.delete() }
+            }
+            if (appContext != null) {
+                runCatching { EncryptedVideoVault.clearIndexedChunks(appContext, uid, lectureId) }
+            }
+        }
+        clearUploadCheckpoint(lectureId)
+        if (appContext != null) {
+            SessionPreferences.removeLocalDownloadItem(appContext, uid, lectureId)
+            val updatedLecturesCache = SessionPreferences.getLocalLecturesCache(appContext)
+                .filterNot { it.id == lectureId }
+            SessionPreferences.saveLocalLecturesCache(appContext, updatedLecturesCache)
+        }
+        runCatching {
+            db.collection("users").document(uid).collection("downloads").document(lectureId).delete().await()
         }
     }
 
@@ -2312,14 +2632,20 @@ class ElghalizRepository(
         val totalMetaFile = GoogleDrive5TbVaultManager.getDownloadTotalBytesMetaFile(vaultDir, lecture.id)
 
         val driveFileId = GoogleDrive5TbVaultManager.extractDriveFileId(lecture.videoSourceUri)
-        val driveConfig = if (!driveFileId.isNullOrBlank()) resolveValidDriveConfig() else null
-        val isLocalTestToken = driveConfig?.accessToken?.startsWith("local_test_") == true
+        val instantToken = (GoogleDrive5TbVaultManager.getInstantAccessTokenOrNull()
+            ?: appContext?.let { SessionPreferences.getLastKnownDriveToken(it) }
+            ?: inMemoryDriveToken).trim()
+        val isLocalTestToken = instantToken.startsWith("local_test_") || inMemoryDriveToken.startsWith("local_test_")
 
         withContext(Dispatchers.IO) {
             if (!driveFileId.isNullOrBlank() && !isLocalTestToken) {
-                val cloudToken = GoogleDrive5TbVaultManager.fetchUploadParamsFromAppsScript().getOrNull()?.accessToken
-                    ?.takeIf { it.isNotBlank() }
-                    ?: driveConfig?.accessToken.orEmpty()
+                val cloudToken = if (instantToken.isNotBlank()) {
+                    instantToken
+                } else {
+                    GoogleDrive5TbVaultManager.fetchUploadParamsFromAppsScript().getOrNull()?.accessToken
+                        ?.takeIf { it.isNotBlank() }
+                        ?: resolveValidDriveConfig()?.accessToken.orEmpty()
+                }
 
                 GoogleDrive5TbVaultManager.downloadAndEncryptRangeStreamToVault(
                     userId = uid,

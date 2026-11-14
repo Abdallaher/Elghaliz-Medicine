@@ -229,6 +229,58 @@ class ElghalizRepositoryRuleTest : FirestoreEmulatorTestBase() {
         }
         assertTrue(approvedChat.isSuccess)
 
+        // 7b. Verify student CANNOT read drive_config or create/delete categories or lectures
+        val studentDriveRead = withTimeout(DEFAULT_TIMEOUT_MS) {
+            studentRepo.getCentralDriveConfig()
+        }
+        assertTrue(studentDriveRead.isFailure)
+
+        val studentCreateCat = withTimeout(DEFAULT_TIMEOUT_MS) {
+            studentRepo.createCategory("Unauthorized", "Should fail", "Student")
+        }
+        assertTrue(studentCreateCat.isFailure)
+
+        val studentDeleteLec = withTimeout(DEFAULT_TIMEOUT_MS) {
+            studentRepo.deleteLecture(lectureId)
+        }
+        assertTrue(studentDeleteLec.isFailure)
+
+        // 7c. Verify Strict Permanent 1-Device Lock in /student_requests/{uid}
+        val dev1Res = withTimeout(DEFAULT_TIMEOUT_MS) {
+            studentRepo.verifyOrRegisterStudentDevice("device_alpha_1").getOrThrow()
+        }
+        assertTrue(dev1Res.first)
+        assertEquals(1, dev1Res.second.size)
+        assertEquals(listOf("device_alpha_1"), dev1Res.second)
+
+        // Any 2nd distinct device is permanently rejected by the 1-device lock per email
+        val dev2Res = withTimeout(DEFAULT_TIMEOUT_MS) {
+            studentRepo.verifyOrRegisterStudentDevice("device_beta_2").getOrThrow()
+        }
+        assertFalse(dev2Res.first)
+        assertEquals(1, dev2Res.second.size)
+        assertEquals(listOf("device_alpha_1"), dev2Res.second)
+
+        // 7d. Verify SessionPreferences encrypts tokens and verified_account_$uid on disk
+        SessionPreferences.saveLastKnownDriveToken(context, "secret_drive_token_$runTag", "folder_1")
+        SessionPreferences.saveVerifiedAccountState(
+            context = context,
+            uid = studentUid,
+            email = studentEmail,
+            isVerifiedAdmin = false,
+            isPrimaryAdmin = false,
+            approvalStatus = "approved"
+        )
+        val rawPrefs = context.getSharedPreferences("elghaliz_session_prefs", Context.MODE_PRIVATE)
+        val rawStoredToken = rawPrefs.getString("last_known_drive_token", "") ?: ""
+        val rawStoredAccount = rawPrefs.getString("verified_account_$studentUid", "") ?: ""
+        assertTrue(rawStoredToken.startsWith("ENC1:"))
+        assertFalse(rawStoredToken.contains("secret_drive_token_$runTag"))
+        assertTrue(rawStoredAccount.startsWith("ENC1:"))
+        assertFalse(rawStoredAccount.contains(studentEmail))
+        assertEquals("secret_drive_token_$runTag", SessionPreferences.getLastKnownDriveToken(context))
+        assertEquals("approved", SessionPreferences.getVerifiedAccountState(context, studentUid, studentEmail)?.approvalStatus)
+
         // 8. Admin suspends the student ("suspended") -> Student loses access immediately
         signInTestUser(primaryAdminEmail)
         val suspendRes = withTimeout(DEFAULT_TIMEOUT_MS) {

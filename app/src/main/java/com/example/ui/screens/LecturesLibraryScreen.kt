@@ -2,16 +2,15 @@ package com.example.ui.screens
 
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,23 +29,20 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
-import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.DownloadForOffline
-import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HourglassTop
-import androidx.compose.material.icons.filled.HowToReg
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.MedicalServices
-import androidx.compose.material.icons.filled.OndemandVideo
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.UploadFile
-import androidx.compose.material.icons.filled.VideoFile
-import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -54,11 +50,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -69,7 +62,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -78,26 +70,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Close
 import com.example.data.model.Category
 import com.example.data.model.CourseRequest
-import com.example.data.model.DownloadTaskState
-import com.example.data.model.DownloadTaskStatus
 import com.example.data.model.Lecture
-import com.example.data.model.MAX_VIDEO_FILE_SIZE_MB
-import com.example.data.model.OfflineDownload
 import com.example.data.model.UploadTaskState
 import com.example.data.model.UploadTaskStatus
 import com.example.ui.components.ElghalizModalDialog
@@ -107,12 +90,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+private val CourseDeepGreen = Color(0xFF0F3D2E)
+private val CourseMidGreen = Color(0xFF1F6B52)
+private val CourseOliveGreen = Color(0xFF5D7A43)
+private val CourseGoldAccent = Color(0xFFC9A24D)
+private val CourseLightBorder = Color(0xFFEFE8D8)
+private val CourseDarkBorder = Color(0xFF1D4B3A)
+
 @Composable
 fun LecturesLibraryScreen(
     isAdminMode: Boolean,
     categoriesState: UiState<List<Category>>,
     lecturesState: UiState<List<Lecture>>,
-    downloadsState: UiState<List<OfflineDownload>>,
     myCourseRequestsList: List<CourseRequest>,
     isUploadingLecture: Boolean,
     uploadProgress: Int = 0,
@@ -120,11 +109,6 @@ fun LecturesLibraryScreen(
     onPauseUpload: () -> Unit = {},
     onResumeUpload: () -> Unit = {},
     onCancelUpload: () -> Unit = {},
-    downloadingLectureIds: Set<String>,
-    downloadProgressMap: Map<String, Int> = emptyMap(),
-    downloadStatesMap: Map<String, DownloadTaskState> = emptyMap(),
-    selectedCategoryId: String?,
-    onSelectCategory: (String?) -> Unit,
     onAddCategory: (name: String, description: String, onCreated: ((String) -> Unit)?) -> Unit,
     onUploadLecture: (
         title: String,
@@ -135,57 +119,25 @@ fun LecturesLibraryScreen(
         durationSeconds: Long,
         fileSizeMb: Long
     ) -> Unit,
-    onRequestCourseEnrollment: (Category) -> Unit,
-    onDeleteLecture: (String) -> Unit,
-    onPlayLecture: (Lecture) -> Unit,
-    onDownloadInAppOnly: (Lecture) -> Unit,
-    onPauseDownload: (Lecture) -> Unit = {},
-    onCancelDownload: (Lecture) -> Unit = {}
+    onOpenCourse: (Category) -> Unit,
+    onRequestCourseEnrollment: (Category) -> Unit
 ) {
+    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
     var showAddCategoryDialog by remember { mutableStateOf(false) }
     var showUploadLectureDialog by remember { mutableStateOf(false) }
+    var statusInfoDialogData by remember { mutableStateOf<Pair<Category, String>?>(null) }
 
     val categories = (categoriesState as? UiState.Success)?.data ?: emptyList()
     val allLectures = (lecturesState as? UiState.Success)?.data ?: emptyList()
-    val downloadedIds = ((downloadsState as? UiState.Success)?.data ?: emptyList())
-        .map { it.lectureId }
-        .toSet()
 
-    // Map of categoryId -> CourseRequest status ("pending", "approved", "suspended") for the current student
+    // Count lectures per course cleanly for the course cards
+    val lectureCountByCategory = remember(allLectures) {
+        allLectures.groupingBy { it.categoryId }.eachCount()
+    }
+
+    // Map of categoryId -> CourseRequest status ("pending", "approved", "suspended")
     val courseStatusByCategoryId = remember(myCourseRequestsList) {
         myCourseRequestsList.associate { it.categoryId to it.status }
-    }
-
-    val approvedCategoryIds = remember(myCourseRequestsList) {
-        myCourseRequestsList.filter { it.status == "approved" }.map { it.categoryId }.toSet()
-    }
-
-    val selectedCategory = remember(categories, selectedCategoryId) {
-        categories.firstOrNull { it.id == selectedCategoryId }
-    }
-
-    val isSelectedCategoryApprovedForStudent = isAdminMode ||
-        (selectedCategoryId != null && approvedCategoryIds.contains(selectedCategoryId))
-
-    // Filter lectures: Admins see all (or by selected category); Students ONLY see lectures in categories they are approved for!
-    val visibleLectures = remember(allLectures, selectedCategoryId, isAdminMode, approvedCategoryIds) {
-        val baseList = if (isAdminMode) {
-            allLectures
-        } else {
-            allLectures.filter { approvedCategoryIds.contains(it.categoryId) }
-        }
-        if (selectedCategoryId == null) {
-            baseList
-        } else {
-            baseList.filter { it.categoryId == selectedCategoryId }
-        }
-    }
-
-    // Automatically select the first category if none is selected
-    LaunchedEffect(categories) {
-        if (selectedCategoryId == null && categories.isNotEmpty()) {
-            onSelectCategory(categories.first().id)
-        }
     }
 
     LazyColumn(
@@ -193,16 +145,16 @@ fun LecturesLibraryScreen(
             .fillMaxSize()
             .testTag("lectures_library_list"),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         // Admin-Only Action Buttons Card
         if (isAdminMode) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(22.dp),
+                    shape = RoundedCornerShape(24.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
+                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f)
                     )
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
@@ -234,18 +186,21 @@ fun LecturesLibraryScreen(
                                     .testTag("add_category_button"),
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary
+                                    containerColor = CourseDeepGreen,
+                                    contentColor = Color.White
                                 )
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.CreateNewFolder,
                                     contentDescription = null,
+                                    tint = CourseGoldAccent,
                                     modifier = Modifier.size(18.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = "إضافة تصنيف / مادة جديدة",
                                     style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -260,7 +215,8 @@ fun LecturesLibraryScreen(
                                     .testTag("upload_lecture_button"),
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.secondary
+                                    containerColor = CourseMidGreen,
+                                    contentColor = Color.White
                                 )
                             ) {
                                 if (isUploadingLecture) {
@@ -289,12 +245,14 @@ fun LecturesLibraryScreen(
                                     Icon(
                                         imageVector = Icons.Default.UploadFile,
                                         contentDescription = null,
+                                        tint = CourseGoldAccent,
                                         modifier = Modifier.size(18.dp)
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
                                         text = "رفع فيديو / محاضرة جديدة",
                                         style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
@@ -302,7 +260,7 @@ fun LecturesLibraryScreen(
                             }
                         }
 
-                        // بطاقة متابعة الرفع المتدفق المباشر مع أزرار الإيقاف المؤقت والاستئناف والإلغاء
+                        // Live Upload Progress Card with Pause / Resume / Cancel
                         val activeTask = uploadTaskState
                         if (isUploadingLecture || (activeTask != null && activeTask.status != UploadTaskStatus.IDLE && activeTask.status != UploadTaskStatus.COMPLETED)) {
                             val isPaused = activeTask?.status == UploadTaskStatus.PAUSED
@@ -312,14 +270,12 @@ fun LecturesLibraryScreen(
                             Spacer(modifier = Modifier.height(10.dp))
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(12.dp),
+                                shape = RoundedCornerShape(14.dp),
                                 colors = CardDefaults.cardColors(
-                                    containerColor = if (isPaused) {
-                                        Color(0xFF2A2408)
-                                    } else if (isError) {
-                                        Color(0xFF3B1515)
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceVariant
+                                    containerColor = when {
+                                        isPaused -> Color(0xFF2A2408)
+                                        isError -> Color(0xFF3B1515)
+                                        else -> MaterialTheme.colorScheme.surfaceVariant
                                     }
                                 )
                             ) {
@@ -476,216 +432,126 @@ fun LecturesLibraryScreen(
             }
         }
 
-    // Dynamic Categories (Courses) Bar - Displays category chips directly (no 'كل المواد' button)
-    if (categories.isNotEmpty()) {
+        // Section Header: الكورسات الطبية
         item {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = "التصنيفات والكورسات الدراسية (${categories.size}):",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold
+                    text = "الكورسات الطبية",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    fontWeight = FontWeight.ExtraBold
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(categories, key = { it.id }) { category ->
-                        val studentCatStatus = courseStatusByCategoryId[category.id]
-                        val chipBadge = if (isAdminMode) {
-                            ""
-                        } else {
-                            when (studentCatStatus) {
-                                "approved" -> " ✓"
-                                "pending" -> " ⏳"
-                                else -> " 🔒"
-                            }
-                        }
-                        FilterChip(
-                            selected = selectedCategoryId == category.id,
-                            onClick = {
-                                onSelectCategory(category.id)
-                            },
-                            label = { Text("${category.name}$chipBadge") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = if (!isAdminMode && studentCatStatus != "approved") {
-                                        Icons.Default.Lock
-                                    } else {
-                                        Icons.Default.FolderOpen
-                                    },
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = MaterialTheme.colorScheme.primary,
-                                selectedLabelColor = Color.White,
-                                selectedLeadingIconColor = Color.White
-                            )
+                if (categories.isNotEmpty()) {
+                    Surface(
+                        color = if (isDarkTheme) Color(0xFF174534) else Color(0xFFE9F0E8),
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            text = "${categories.size} كورسات",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (isDarkTheme) CourseGoldAccent else CourseDeepGreen,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
                         )
                     }
+                }
+            }
+        }
+
+        // Clean List of Medical Course Cards ONLY (No "Continue Watching", No flat lecture cards)
+        when {
+            categoriesState is UiState.Loading && categories.isEmpty() -> {
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 48.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+
+            categories.isEmpty() -> {
+                item {
+                    EmptyCoursesCard(
+                        isAdminMode = isAdminMode,
+                        onAddCategoryClick = { showAddCategoryDialog = true },
+                        onUploadLectureClick = { showUploadLectureDialog = true }
+                    )
+                }
+            }
+
+            else -> {
+                items(categories, key = { it.id }) { category ->
+                    val lectureCount = lectureCountByCategory[category.id] ?: 0
+                    val enrollmentStatus = courseStatusByCategoryId[category.id]
+                    MedicalCourseCard(
+                        category = category,
+                        lectureCount = lectureCount,
+                        isAdminMode = isAdminMode,
+                        enrollmentStatus = enrollmentStatus,
+                        isDarkTheme = isDarkTheme,
+                        onCardClick = {
+                            if (isAdminMode || enrollmentStatus == "approved") {
+                                onOpenCourse(category)
+                            } else if (enrollmentStatus == null) {
+                                onRequestCourseEnrollment(category)
+                            } else {
+                                statusInfoDialogData = category to enrollmentStatus
+                            }
+                        },
+                        onRequestEnrollment = { onRequestCourseEnrollment(category) }
+                    )
                 }
             }
         }
     }
 
-        // For Students when "All Courses" is selected: show Course Enrollment Cards for any course they are not yet approved in!
-        if (!isAdminMode && selectedCategoryId == null && categories.isNotEmpty()) {
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(22.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "حالة اشتراكك في الكورسات والتصنيفات المتاحة:",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.Bold
-                        )
-                        categories.forEach { cat ->
-                            val status = courseStatusByCategoryId[cat.id]
-                            Surface(
-                                shape = RoundedCornerShape(14.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onSelectCategory(cat.id) }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = cat.name,
-                                            style = MaterialTheme.typography.titleMedium,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Text(
-                                            text = when (status) {
-                                                "approved" -> "مشترك ومفعّل • اضغط لعرض المحاضرات"
-                                                "pending" -> "طلب الانضمام للكورس قيد المراجعة عند الدكتور"
-                                                "suspended" -> "تم إيقاف اشتراكك في هذا الكورس"
-                                                else -> "غير مشترك • اضغط لطلب الانضمام لهذا الكورس"
-                                            },
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = if (status == "approved") {
-                                                MaterialTheme.colorScheme.primary
-                                            } else {
-                                                MaterialTheme.colorScheme.onSurfaceVariant
-                                            }
-                                        )
-                                    }
-
-                                    when (status) {
-                                        "approved" -> {
-                                            FilledTonalButton(
-                                                onClick = { onSelectCategory(cat.id) },
-                                                shape = RoundedCornerShape(10.dp)
-                                            ) {
-                                                Text("فتح الكورس")
-                                            }
-                                        }
-                                        "pending" -> {
-                                            Surface(
-                                                color = Color(0xFFD97706).copy(alpha = 0.15f),
-                                                shape = RoundedCornerShape(50)
-                                            ) {
-                                                Text(
-                                                    text = "⏳ بالانتظار",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = Color(0xFFD97706),
-                                                    fontWeight = FontWeight.Bold,
-                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                                )
-                                            }
-                                        }
-                                        else -> {
-                                            Button(
-                                                onClick = { onRequestCourseEnrollment(cat) },
-                                                shape = RoundedCornerShape(10.dp),
-                                                modifier = Modifier.testTag("request_course_btn_${cat.id}")
-                                            ) {
-                                                Text("طلب انضمام للكورس")
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Per-Category Second Approval Gate:
-        // If a student selects a specific Category that they are NOT approved for yet, show the Course Request Gate!
-        if (!isAdminMode && selectedCategory != null && !isSelectedCategoryApprovedForStudent) {
-            item {
-                val status = courseStatusByCategoryId[selectedCategory.id]
-                CourseEnrollmentGateCard(
-                    category = selectedCategory,
-                    enrollmentStatus = status,
-                    onRequestEnrollment = { onRequestCourseEnrollment(selectedCategory) }
+    val dialogInfo = statusInfoDialogData
+    if (dialogInfo != null) {
+        val (cat, status) = dialogInfo
+        AlertDialog(
+            onDismissRequest = { statusInfoDialogData = null },
+            icon = {
+                Icon(
+                    imageVector = if (status == "pending") Icons.Default.HourglassTop else Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = if (status == "pending") CourseGoldAccent else MaterialTheme.colorScheme.error
                 )
-            }
-        } else {
-            // Loading / Empty / Lectures List
-            when {
-                lecturesState is UiState.Loading && categoriesState is UiState.Loading -> {
-                    item {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 48.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                }
-
-                visibleLectures.isEmpty() -> {
-                    item {
-                        EmptyLibraryCard(
-                            isAdminMode = isAdminMode,
-                            hasCategories = categories.isNotEmpty(),
-                            hasApprovedCourses = approvedCategoryIds.isNotEmpty(),
-                            onAddCategoryClick = { showAddCategoryDialog = true },
-                            onUploadLectureClick = { showUploadLectureDialog = true }
-                        )
-                    }
-                }
-
-                else -> {
-                    items(visibleLectures, key = { it.id }) { lecture ->
-                        val taskState = downloadStatesMap[lecture.id]
-                        LectureItemCard(
-                            lecture = lecture,
-                            isDownloadedInApp = downloadedIds.contains(lecture.id) || taskState?.status == DownloadTaskStatus.COMPLETED,
-                            isDownloadingNow = downloadingLectureIds.contains(lecture.id) || taskState?.status == DownloadTaskStatus.DOWNLOADING,
-                            isPausedNow = taskState?.status == DownloadTaskStatus.PAUSED,
-                            downloadProgressPercent = taskState?.progressPercent ?: downloadProgressMap[lecture.id] ?: 0,
-                            downloadStatusLabel = taskState?.statusLabel ?: "",
-                            isAdminMode = isAdminMode,
-                            onPlayClick = { onPlayLecture(lecture) },
-                            onDownloadInAppClick = { onDownloadInAppOnly(lecture) },
-                            onPauseDownloadClick = { onPauseDownload(lecture) },
-                            onCancelDownloadClick = { onCancelDownload(lecture) },
-                            onDeleteClick = { onDeleteLecture(lecture.id) }
-                        )
-                    }
+            },
+            title = {
+                Text(
+                    text = cat.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+            },
+            text = {
+                Text(
+                    text = if (status == "pending") {
+                        "طلب انضمامك لكورس «${cat.name}» قيد المراجعة حالياً عند الدكتور / المسؤول. سيتم فتح الكورس ومحاضراته فور الموافقة."
+                    } else {
+                        "تم إيقاف أو رفض اشتراكك في كورس «${cat.name}» من قِبل الدكتور. يرجى مراجعة إدارة المنصة."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { statusInfoDialogData = null }) {
+                    Text("حسناً", fontWeight = FontWeight.Bold)
                 }
             }
-        }
+        )
     }
 
     if (showAddCategoryDialog) {
@@ -714,135 +580,202 @@ fun LecturesLibraryScreen(
 }
 
 @Composable
-private fun CourseEnrollmentGateCard(
+private fun MedicalCourseCard(
     category: Category,
-    enrollmentStatus: String?, // null, "pending", "suspended"
+    lectureCount: Int,
+    isAdminMode: Boolean,
+    enrollmentStatus: String?,
+    isDarkTheme: Boolean,
+    onCardClick: () -> Unit,
     onRequestEnrollment: () -> Unit
 ) {
-    Card(
+    val isLocked = !isAdminMode && enrollmentStatus != "approved"
+    val lectureCountText = when (lectureCount) {
+        0 -> "لا توجد محاضرات بعد"
+        1 -> "محاضرة واحدة"
+        2 -> "محاضرتان"
+        in 3..10 -> "$lectureCount محاضرات"
+        else -> "$lectureCount محاضرة"
+    }
+
+    ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 12.dp)
-            .testTag("course_enrollment_gate_${category.id}"),
-        shape = RoundedCornerShape(26.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+            .clickable(onClick = onCardClick)
+            .testTag("course_card_${category.id}"),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(26.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+        Surface(
+            color = Color.Transparent,
+            border = BorderStroke(1.dp, if (isDarkTheme) CourseDarkBorder else CourseLightBorder),
+            shape = RoundedCornerShape(24.dp),
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Box(
+            Row(
                 modifier = Modifier
-                    .size(80.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
-                contentAlignment = Alignment.Center
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 15.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(
-                    imageVector = if (enrollmentStatus == "pending") Icons.Default.HourglassTop else Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(40.dp)
-                )
-            }
+                // Emerald course badge icon
+                Box(
+                    modifier = Modifier
+                        .size(50.dp)
+                        .clip(RoundedCornerShape(15.dp))
+                        .background(CourseDeepGreen),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MedicalServices,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(25.dp)
+                    )
+                }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "كورس / تصنيف: ${category.name}",
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-
-            if (category.description.isNotBlank()) {
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = category.description,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            when (enrollmentStatus) {
-                "pending" -> {
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier.fillMaxWidth()
+                // Course Title + Lectures Count
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "طلب انضمامك لكورس «${category.name}» قيد المراجعة",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = "يرجى انتظار موافقة الدكتور / المسؤول من قسم (طلبات الانضمام لكورس معين) لتفعيل ظهور محاضرات هذا التصنيف لك.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center
+                        Text(
+                            text = category.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        if (isLocked) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "مقفل",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
                             )
                         }
                     }
-                }
-
-                "suspended" -> {
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = "تم إيقاف أو رفض اشتراكك في كورس «${category.name}» من قِبل الدكتور. يرجى مراجعة إدارة الكورس.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(16.dp)
-                        )
-                    }
-                }
-
-                else -> {
+                    Spacer(modifier = Modifier.height(3.dp))
                     Text(
-                        text = "هذا التصنيف مخصص للطلاب المشتركين في كورس «${category.name}». اضغط على الزر أدناه لإرسال طلب انضمام للكورس إلى الدكتور:",
-                        style = MaterialTheme.typography.bodyMedium,
+                        text = lectureCountText,
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
+                        fontWeight = FontWeight.Medium
                     )
+                }
 
-                    Spacer(modifier = Modifier.height(18.dp))
+                // Status Pill / Enrollment Action + Chevron
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    when {
+                        isAdminMode -> {
+                            Surface(
+                                color = CourseMidGreen,
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = "فتح الكورس",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
 
-                    Button(
-                        onClick = onRequestEnrollment,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("submit_course_request_button"),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary
-                        )
-                    ) {
-                        Icon(imageVector = Icons.Default.HowToReg, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "طلب الانضمام لهذا الكورس (${category.name})",
-                            style = MaterialTheme.typography.labelLarge
-                        )
+                        enrollmentStatus == "approved" -> {
+                            Surface(
+                                color = CourseMidGreen,
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = "مفعّل ✓",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+
+                        enrollmentStatus == "pending" -> {
+                            Surface(
+                                color = CourseGoldAccent,
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = "بانتظار الموافقة",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+
+                        enrollmentStatus == "suspended" -> {
+                            Surface(
+                                color = MaterialTheme.colorScheme.errorContainer,
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = "موقوف",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+
+                        else -> {
+                            Button(
+                                onClick = onRequestEnrollment,
+                                shape = RoundedCornerShape(50),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = CourseOliveGreen,
+                                    contentColor = Color.White
+                                ),
+                                modifier = Modifier
+                                    .height(36.dp)
+                                    .testTag("request_course_btn_${category.id}")
+                            ) {
+                                Text(
+                                    text = "طلب انضمام للكورس",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -851,17 +784,15 @@ private fun CourseEnrollmentGateCard(
 }
 
 @Composable
-private fun EmptyLibraryCard(
+private fun EmptyCoursesCard(
     isAdminMode: Boolean,
-    hasCategories: Boolean,
-    hasApprovedCourses: Boolean,
     onAddCategoryClick: () -> Unit,
     onUploadLectureClick: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 12.dp),
+            .padding(vertical = 8.dp),
         shape = RoundedCornerShape(26.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -880,7 +811,7 @@ private fun EmptyLibraryCard(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Default.VideoLibrary,
+                    imageVector = Icons.Default.School,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(38.dp)
@@ -888,22 +819,18 @@ private fun EmptyLibraryCard(
             }
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = when {
-                    !hasCategories -> "مكتبة المحاضرات والتصنيفات فارغة حالياً"
-                    !isAdminMode && !hasApprovedCourses -> "اختر الكورس من القائمة أعلاه واطلب الانضمام إليه"
-                    else -> "لا توجد محاضرات مرفوعة في هذا التصنيف بعد"
-                },
+                text = "لا توجد كورسات طبية مضافة حالياً",
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = when {
-                    isAdminMode -> "بصفتك دكتور / مسؤول في Elghaliz Medicine، يمكنك البدء الآن بإضافة التصنيفات والمواد الدراسية بنفسك ثم رفع ملف الفيديو الفعلي من هاتفك."
-                    !hasCategories -> "لم يقم الدكاترة والمسؤولون بإضافة أقسام أو محاضرات بعد."
-                    !hasApprovedCourses -> "لأن كل طالب يشترك في كورسات محددة، اضغط على زر \"طلب انضمام للكورس\" بجانب المادة المطلوبة ليقوم الدكتور بتفعيلها لك."
-                    else -> "لم يتم رفع محاضرات داخل هذا الكورس حتى الآن."
+                text = if (isAdminMode) {
+                    "ابدأ الآن بإضافة أول كورس طبي ثم ارفع المحاضرات المرئية من هاتفك ليتمكن الطلاب من الاشتراك ومشاهدتها."
+                } else {
+                    "لم يقم الدكاترة بإضافة كورسات طبية حتى الآن، سيتم عرض الكورسات هنا فور إضافتها."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -919,358 +846,22 @@ private fun EmptyLibraryCard(
                     ) {
                         Icon(imageVector = Icons.Default.Add, contentDescription = null)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("إضافة تصنيف جديد")
+                        Text("إضافة كورس جديد")
                     }
                     Button(
                         onClick = onUploadLectureClick,
                         shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        colors = ButtonDefaults.buttonColors(containerColor = CourseDeepGreen)
                     ) {
                         Icon(imageVector = Icons.Default.UploadFile, contentDescription = null)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("رفع محاضرة من الهاتف")
+                        Text("رفع محاضرة")
                     }
                 }
             }
         }
     }
 }
-
-@Composable
-private fun LectureItemCard(
-    lecture: Lecture,
-    isDownloadedInApp: Boolean,
-    isDownloadingNow: Boolean,
-    isPausedNow: Boolean = false,
-    downloadProgressPercent: Int = 0,
-    downloadStatusLabel: String = "",
-    isAdminMode: Boolean,
-    onPlayClick: () -> Unit,
-    onDownloadInAppClick: () -> Unit,
-    onPauseDownloadClick: () -> Unit = {},
-    onCancelDownloadClick: () -> Unit = {},
-    onDeleteClick: () -> Unit
-) {
-    ElevatedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("lecture_card_${lecture.id}"),
-        shape = RoundedCornerShape(26.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surface
-        ),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 3.dp)
-    ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
-            // Row 1: Green Gradient Thumbnail + Category Chip + Delete Icon (Doctor)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Green gradient thumbnail with a gold play icon
-                Box(
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(
-                            Brush.linearGradient(
-                                colors = listOf(
-                                    Color(0xFF0F3D2E),
-                                    Color(0xFF1F6B52)
-                                )
-                            )
-                        )
-                        .clickable(onClick = onPlayClick),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = Color(0xFFC9A24D),
-                        modifier = Modifier.size(26.dp)
-                    )
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(
-                        color = Color(0xFFE9F0E8),
-                        shape = RoundedCornerShape(50)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.FolderOpen,
-                                contentDescription = null,
-                                tint = Color(0xFF1F6B52),
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = lecture.categoryName.ifBlank { "كورس طبي" },
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color(0xFF1F6B52),
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    if (isAdminMode) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                        IconButton(onClick = onDeleteClick) {
-                            Icon(
-                                imageVector = Icons.Default.DeleteOutline,
-                                contentDescription = "حذف المحاضرة",
-                                tint = MaterialTheme.colorScheme.error
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            // Row 2: Full Width Lecture Title (100% width on dedicated row to prevent pharmacolo / gy line-breaking)
-            Text(
-                text = lecture.title,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // Row 3: Metadata: د. Abdallah.surour · 03:06:24 · 330 MB
-            Text(
-                text = "د. ${lecture.doctorName.ifBlank { "Abdallah.surour" }} · ${formatLectureDuration(lecture.durationSeconds)} · ${formatLectureSize(lecture.fileSizeMb)}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.Medium
-            )
-
-            val cleanCardDescription = lecture.description.trim().takeUnless {
-                it == "محاضرة مرئية مرفوعة مباشرة إلى مخزن الـ 5 تيرابايت المركزي" ||
-                    it == "محاضرة طبية مرفوعة لتطبيق Elghaliz Medicine بالجودة الأصلية الكاملة" ||
-                    it == "محاضرة مرئية"
-            }.orEmpty()
-            if (cleanCardDescription.isNotBlank()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = cleanCardDescription,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // Watch Button: Deep green #0F3D2E, radius 16dp, height 48dp
-                Button(
-                    onClick = onPlayClick,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("watch_lecture_btn_${lecture.id}"),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF0F3D2E),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = Color(0xFFC9A24D),
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("مشاهدة", fontWeight = FontWeight.Bold)
-                }
-
-                    if (isPausedNow) {
-                        Button(
-                            onClick = onDownloadInAppClick,
-                            modifier = Modifier
-                                .weight(1.25f)
-                                .height(48.dp)
-                                .testTag("download_in_app_btn_${lecture.id}"),
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF0D6E52),
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Text(
-                                text = "▶️ استمرار (من ${downloadProgressPercent.coerceIn(0, 99)}%)",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    } else {
-                        Button(
-                            onClick = onDownloadInAppClick,
-                            enabled = !isDownloadedInApp && !isDownloadingNow,
-                            modifier = Modifier
-                                .weight(1.25f)
-                                .height(48.dp)
-                                .testTag("download_in_app_btn_${lecture.id}"),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFFE9F0E8),
-                                contentColor = Color(0xFF0F3D2E),
-                                disabledContainerColor = Color(0xFFE9F0E8).copy(alpha = 0.6f),
-                                disabledContentColor = Color(0xFF0F3D2E).copy(alpha = 0.6f)
-                            )
-                        ) {
-                            if (isDownloadingNow) {
-                                CircularProgressIndicator(
-                                    color = Color(0xFF0F3D2E),
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "جاري التنزيل (${downloadProgressPercent.coerceIn(0, 99)}%)",
-                                    color = Color(0xFF0F3D2E),
-                                    fontWeight = FontWeight.Bold
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = if (isDownloadedInApp) Icons.Default.CheckCircle else Icons.Default.DownloadForOffline,
-                                    contentDescription = null,
-                                    tint = if (isDownloadedInApp) Color(0xFF1F6B52) else Color(0xFF0F3D2E),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (isDownloadedInApp) {
-                                        "تم التنزيل ✓"
-                                    } else {
-                                        "تنزيل داخل التطبيق"
-                                    },
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    color = Color(0xFF0F3D2E),
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if (isDownloadingNow || isPausedNow) {
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (isPausedNow) {
-                                        "متوقف مؤقتاً (${downloadProgressPercent.coerceIn(0, 99)}%)"
-                                    } else {
-                                        "جاري التنزيل (${downloadProgressPercent.coerceIn(0, 99)}%)"
-                                    },
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = "${downloadProgressPercent.coerceIn(0, 100)}%",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                            LinearProgressIndicator(
-                                progress = { (downloadProgressPercent.coerceIn(0, 100)) / 100f },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(7.dp)
-                                    .clip(RoundedCornerShape(50)),
-                                color = if (isPausedNow) Color(0xFF0D6E52) else MaterialTheme.colorScheme.primary
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                if (isDownloadingNow) {
-                                    OutlinedButton(
-                                        onClick = onPauseDownloadClick,
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .testTag("pause_download_btn_${lecture.id}"),
-                                        shape = RoundedCornerShape(10.dp)
-                                    ) {
-                                        Text(
-                                            text = "|| إيقاف مؤقت",
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                } else if (isPausedNow) {
-                                    Button(
-                                        onClick = onDownloadInAppClick,
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .testTag("resume_download_btn_${lecture.id}"),
-                                        shape = RoundedCornerShape(10.dp),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = Color(0xFF0D6E52),
-                                            contentColor = Color.White
-                                        )
-                                    ) {
-                                        Text(
-                                            text = "▶️ استمرار (من ${downloadProgressPercent.coerceIn(0, 99)}%)",
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                }
-
-                                OutlinedButton(
-                                    onClick = onCancelDownloadClick,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .testTag("cancel_download_btn_${lecture.id}"),
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.error
-                                    )
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Cancel,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("إلغاء التنزيل")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
 @Composable
 private fun AddCategoryModal(
@@ -1413,7 +1004,6 @@ private fun UploadLectureModal(
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                // 1. اختيار الكورس
                 Text(
                     text = "1. اختيار الكورس:",
                     style = MaterialTheme.typography.labelLarge,
@@ -1470,7 +1060,6 @@ private fun UploadLectureModal(
                     }
                 }
 
-                // 2. كتابة عنوان المحاضرة
                 Text(
                     text = "2. كتابة عنوان المحاضرة:",
                     style = MaterialTheme.typography.labelLarge,
@@ -1488,7 +1077,6 @@ private fun UploadLectureModal(
                         .testTag("lecture_title_input")
                 )
 
-                // 3. زر اختيار ملف الفيديو من الهاتف فقط
                 Text(
                     text = "3. ملف الفيديو:",
                     style = MaterialTheme.typography.labelLarge,
@@ -1665,22 +1253,22 @@ private fun UploadLectureModal(
     )
 }
 
-private fun formatLectureDuration(seconds: Long): String {
+internal fun formatLectureDuration(seconds: Long): String {
     val safeSec = seconds.coerceAtLeast(1L)
     val hrs = safeSec / 3600L
     val mins = (safeSec % 3600L) / 60L
     val secs = safeSec % 60L
-    return when {
-        hrs > 0L -> "%02d:%02d:%02d (%d س %d د)".format(hrs, mins, secs, hrs, mins)
-        mins > 0L -> "%02d:%02d (%d دقيقة)".format(mins, secs, mins)
-        else -> "$secs ثانية"
+    return if (hrs > 0L) {
+        "%02d:%02d:%02d".format(hrs, mins, secs)
+    } else {
+        "%02d:%02d".format(mins, secs)
     }
 }
 
-private fun formatLectureSize(sizeMb: Long): String {
+internal fun formatLectureSize(sizeMb: Long): String {
     return if (sizeMb >= 1024L) {
         val gb = sizeMb.toDouble() / 1024.0
-        "%.2f GB (%d MB)".format(gb, sizeMb)
+        "%.2f GB".format(gb)
     } else {
         "${sizeMb.coerceAtLeast(1L)} MB"
     }
@@ -1754,7 +1342,6 @@ private suspend fun copyPickedVideoToInternalFile(
             }
         }
 
-        // استخراج مدة الفيديو فقط بدون استخراج أي إطارات مصغرة من الفيديو
         val durationSec = runCatching {
             val retriever = MediaMetadataRetriever()
             try {
@@ -1788,7 +1375,6 @@ private suspend fun copyPickedVideoToInternalFile(
             }
         }.getOrDefault(60L)
 
-        // نعتمد فوراً على رابط الـ URI الفعلي المباشر بدون نسخ مسبق يثقل الرام أو يجمّد التطبيق
         val finalSizeBytes = if (reportedSizeBytes > 0L) {
             reportedSizeBytes
         } else {
@@ -1807,4 +1393,3 @@ private suspend fun copyPickedVideoToInternalFile(
         )
     }.getOrNull()
 }
-

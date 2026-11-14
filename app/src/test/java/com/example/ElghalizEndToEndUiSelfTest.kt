@@ -184,7 +184,39 @@ class ElghalizEndToEndUiSelfTest : FirestoreEmulatorTestBase() {
         pumpMainLooperAndClock()
         composeTestRule.onNodeWithTag("confirm_upload_lecture_button").assertIsEnabled().performClick()
         pumpMainLooperAndClock()
+
+        // Main screen shows Courses only (no "أكمل من حيث توقفت" card)
+        assertTrue(
+            composeTestRule.onAllNodesWithText("أكمل من حيث توقفت", substring = true, useUnmergedTree = true)
+                .fetchSemanticsNodes().isEmpty()
+        )
+
+        // Open the Course Card -> navigates to unified Course Player Page
+        composeTestRule.onAllNodesWithText(newCourseName, substring = true, useUnmergedTree = true)[0]
+            .performClick()
+        pumpMainLooperAndClock()
+
+        waitForTag("course_player_back_button")
         waitForTextSubstring(newLectureTitle)
+        composeTestRule.onNodeWithTag("course_player_play_pause").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("course_tab_lectures").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("course_tab_notes").assertIsDisplayed().performClick()
+        pumpMainLooperAndClock()
+
+        waitForTag("course_note_input")
+        composeTestRule.onNodeWithTag("course_note_input").performTextReplacement("ملاحظة تجريبية مهمة")
+        composeTestRule.onNodeWithTag("add_course_note_button").assertIsEnabled().performClick()
+        pumpMainLooperAndClock()
+        waitForTextSubstring("ملاحظة تجريبية مهمة")
+
+        composeTestRule.onNodeWithTag("course_tab_lectures").performClick()
+        pumpMainLooperAndClock()
+        waitForTextSubstring(newLectureTitle)
+
+        // Return from Course Player Page back to Courses List
+        composeTestRule.onNodeWithTag("course_player_back_button").performClick()
+        pumpMainLooperAndClock()
+        waitForTag("nav_tab_exams")
 
         // 2.3 Tab 1 (الاختبارات) & Button: رفع اختبار PDF بتوقيت (Upload Timed PDF Exam)
         composeTestRule.onNodeWithTag("nav_tab_exams").performClick()

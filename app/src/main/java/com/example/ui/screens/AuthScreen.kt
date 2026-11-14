@@ -230,94 +230,52 @@ fun AuthScreen(
                 shape = RoundedCornerShape(topStart = 38.dp, topEnd = 38.dp),
                 color = sheetBgColor,
                 tonalElevation = 8.dp,
-                shadowElevation = 16.dp
+                shadowElevation = 18.dp
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 22.dp, vertical = 26.dp),
+                        .padding(horizontal = 24.dp, vertical = 28.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Drag handle pill
+                    // Subtle Gold Drag Handle Pill
                     Box(
                         modifier = Modifier
-                            .width(48.dp)
-                            .height(5.dp)
+                            .width(44.dp)
+                            .height(4.dp)
                             .clip(RoundedCornerShape(50))
                             .background(AuthGold.copy(alpha = 0.55f))
                     )
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
                     Text(
                         text = stringResource(R.string.choose_role_prompt),
-                        style = MaterialTheme.typography.titleLarge,
+                        style = MaterialTheme.typography.headlineSmall,
                         color = primaryTextColor,
                         fontWeight = FontWeight.ExtraBold,
                         textAlign = TextAlign.Center
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     Text(
-                        text = "يتم حفظ إيميلك وصفتك تلقائياً بعد أول تسجيل دخول",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = "حدّد صفتك الأكاديمية للمتابعة بأمان إلى حسابك",
+                        style = MaterialTheme.typography.bodyMedium,
                         color = mutedTextColor,
                         textAlign = TextAlign.Center
                     )
 
-                    if (lastSavedEmail.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = AuthMintSecondary.copy(alpha = if (isDarkTheme) 0.15f else 1f),
-                            border = BorderStroke(1.dp, AuthGold.copy(alpha = 0.4f)),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.VerifiedUser,
-                                    contentDescription = null,
-                                    tint = if (isDarkTheme) AuthGold else AuthMidGreen,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "آخر حساب محفوظ: ${lastSavedName.ifBlank { lastSavedEmail }} ($lastSavedEmail)",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = primaryTextColor,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                    }
+                    Spacer(modifier = Modifier.height(22.dp))
 
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Two Selectable Role Cards: "مسؤول / دكتور" and "طالب"
+                    // Two Selectable Role Cards: "طالب" and "مسؤول / دكتور"
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         RoleSelectionCard(
-                            title = stringResource(R.string.role_admin_doctor_title),
-                            description = stringResource(R.string.role_admin_doctor_desc),
-                            icon = Icons.Default.AdminPanelSettings,
-                            isSelected = selectedRole == UserRoleMode.ADMIN,
-                            isDarkTheme = isDarkTheme,
-                            cardBgColor = cardBgColor,
-                            onClick = { onRoleSelected(UserRoleMode.ADMIN) },
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("role_admin_card")
-                        )
-
-                        RoleSelectionCard(
                             title = stringResource(R.string.role_student_title),
-                            description = stringResource(R.string.role_student_desc),
+                            description = "مشاهدة المحاضرات وحل الاختبارات",
                             icon = Icons.Default.School,
                             isSelected = selectedRole == UserRoleMode.STUDENT,
                             isDarkTheme = isDarkTheme,
@@ -327,14 +285,27 @@ fun AuthScreen(
                                 .weight(1f)
                                 .testTag("role_student_card")
                         )
+
+                        RoleSelectionCard(
+                            title = stringResource(R.string.role_admin_doctor_title),
+                            description = "إدارة الكورسات ورفع المحاضرات",
+                            icon = Icons.Default.AdminPanelSettings,
+                            isSelected = selectedRole == UserRoleMode.ADMIN,
+                            isDarkTheme = isDarkTheme,
+                            cardBgColor = cardBgColor,
+                            onClick = { onRoleSelected(UserRoleMode.ADMIN) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("role_admin_card")
+                        )
                     }
 
                     if (!errorMessage.isNullOrBlank()) {
-                        Spacer(modifier = Modifier.height(14.dp))
+                        Spacer(modifier = Modifier.height(16.dp))
                         Surface(
                             shape = RoundedCornerShape(16.dp),
-                            color = Color(0xFFFBEDEA),
-                            border = BorderStroke(1.dp, Color(0xFFB04A44).copy(alpha = 0.35f)),
+                            color = if (isDarkTheme) Color(0xFF451B1A) else Color(0xFFFBEDEA),
+                            border = BorderStroke(1.dp, Color(0xFFB04A44).copy(alpha = 0.4f)),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("auth_error_banner")
@@ -342,7 +313,7 @@ fun AuthScreen(
                             Text(
                                 text = errorMessage,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color(0xFFB04A44),
+                                color = if (isDarkTheme) Color(0xFFFFB4AB) else Color(0xFFB04A44),
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(12.dp),
                                 textAlign = TextAlign.Center
@@ -350,9 +321,9 @@ fun AuthScreen(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(18.dp))
+                    Spacer(modifier = Modifier.height(24.dp))
 
-                    // Primary Deep-Green Sign-In Button
+                    // Wide Primary Deep-Green Google Sign-In Button (54.dp)
                     Button(
                         onClick = onSignInWithGoogle,
                         enabled = !isSigningIn,
@@ -361,9 +332,13 @@ fun AuthScreen(
                             containerColor = AuthDeepGreen,
                             contentColor = Color.White
                         ),
+                        elevation = ButtonDefaults.buttonElevation(
+                            defaultElevation = 4.dp,
+                            pressedElevation = 1.dp
+                        ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(52.dp)
+                            .height(54.dp)
                             .testTag("google_sign_in_button")
                     ) {
                         if (isSigningIn) {
@@ -382,47 +357,37 @@ fun AuthScreen(
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.Login,
                                 contentDescription = null,
-                                tint = AuthGold
+                                tint = AuthGold,
+                                modifier = Modifier.size(22.dp)
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = if (selectedRole == UserRoleMode.ADMIN) {
-                                    "تسجيل الدخول كدكتور / مسؤول (Sign in with Google)"
-                                } else {
-                                    "تسجيل الدخول كطالب (Sign in with Google)"
-                                },
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold
+                                text = "تسجيل الدخول عبر Google",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
                             )
                         }
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    // Mint Secondary Button for iPhone / iOS Users
-                    Button(
+                    TextButton(
                         onClick = { showIosWebAppGuideDialog = true },
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isDarkTheme) Color(0xFF1A4636) else AuthMintSecondary,
-                            contentColor = if (isDarkTheme) AuthGold else AuthDeepGreen
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .testTag("ios_guide_button")
+                        modifier = Modifier.testTag("ios_guide_button")
                     ) {
                         Icon(
                             imageVector = Icons.Default.PhoneIphone,
                             contentDescription = null,
                             tint = if (isDarkTheme) AuthGold else AuthMidGreen,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(18.dp)
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "طريقة تسجيل الدخول لمستخدمي الآيفون (iPhone / iOS)",
+                            text = "دليل الدخول لمستخدمي iPhone / iOS",
                             style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold
+                            color = if (isDarkTheme) AuthGold else AuthMidGreen,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
@@ -544,7 +509,7 @@ private fun RoleSelectionCard(
     modifier: Modifier = Modifier
 ) {
     val containerColor = if (isSelected) {
-        if (isDarkTheme) Color(0xFF1A4B39) else AuthMintSecondary
+        if (isDarkTheme) Color(0xFF174938) else AuthMintSecondary
     } else {
         cardBgColor
     }
@@ -556,42 +521,39 @@ private fun RoleSelectionCard(
 
     Card(
         modifier = modifier
-            .clip(RoundedCornerShape(24.dp))
+            .clip(RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
             .border(
                 width = if (isSelected) 2.dp else 1.dp,
                 color = borderColor,
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(20.dp)
             ),
-        shape = RoundedCornerShape(24.dp),
+        shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = containerColor),
         elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 4.dp else 1.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(horizontal = 14.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Box(modifier = Modifier.fillMaxWidth()) {
                 Box(
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(48.dp)
+                        .align(Alignment.Center)
                         .clip(CircleShape)
                         .background(
-                            if (isSelected) AuthDeepGreen else AuthMidGreen.copy(alpha = 0.14f)
+                            if (isSelected) AuthDeepGreen else AuthMidGreen.copy(alpha = 0.13f)
                         ),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = icon,
                         contentDescription = null,
-                        tint = if (isSelected) AuthGold else AuthMidGreen,
-                        modifier = Modifier.size(22.dp)
+                        tint = if (isSelected) AuthGold else if (isDarkTheme) AuthGold else AuthMidGreen,
+                        modifier = Modifier.size(24.dp)
                     )
                 }
 
@@ -600,18 +562,20 @@ private fun RoleSelectionCard(
                         imageVector = Icons.Default.CheckCircle,
                         contentDescription = null,
                         tint = AuthGold,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier
+                            .size(20.dp)
+                            .align(Alignment.TopEnd)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             Text(
                 text = title,
                 style = MaterialTheme.typography.titleMedium,
                 color = if (isDarkTheme) Color.White else AuthDeepGreen,
-                fontWeight = FontWeight.Bold,
+                fontWeight = FontWeight.ExtraBold,
                 textAlign = TextAlign.Center
             )
 
@@ -619,10 +583,11 @@ private fun RoleSelectionCard(
 
             Text(
                 text = description,
-                style = MaterialTheme.typography.labelSmall.copy(lineHeight = 15.sp),
+                style = MaterialTheme.typography.labelSmall.copy(lineHeight = 16.sp),
                 color = if (isDarkTheme) Color(0xFFB8CEC4) else Color(0xFF5E6A63),
                 textAlign = TextAlign.Center,
-                minLines = 3
+                minLines = 2,
+                maxLines = 2
             )
         }
     }

@@ -1,9 +1,12 @@
 package com.example
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -56,6 +59,7 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.outlined.AdminPanelSettings
 import androidx.compose.material.icons.outlined.DownloadForOffline
@@ -64,13 +68,17 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -103,19 +111,25 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import androidx.credentials.CredentialManager
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.example.data.model.AppUpdateInfo
 import com.example.data.model.Category
 import com.example.data.model.SessionPreferences
 import com.example.data.model.UserRoleMode
 import com.example.data.repository.ElghalizRepository
 import com.example.ui.components.MedicalVideoPlayerDialog
 import com.example.ui.screens.AuthScreen
+import com.example.ui.screens.CoursePlayerScreen
 import com.example.ui.screens.DownloadsAndAdminScreen
 import com.example.ui.screens.ExamsScreen
 import com.example.ui.screens.LecturesLibraryScreen
@@ -590,7 +604,7 @@ fun MainMedicalWorkspace(
     val isCheckingRole by viewModel.isCheckingRole.collectAsStateWithLifecycle()
     val studentApprovalStatus by viewModel.studentApprovalStatus.collectAsStateWithLifecycle()
     val bannerMessage by viewModel.bannerMessage.collectAsStateWithLifecycle()
-    val selectedCategoryId by viewModel.selectedCategoryId.collectAsStateWithLifecycle()
+    val openedCourseId by viewModel.openedCourseId.collectAsStateWithLifecycle()
     val activePlayingLecture by viewModel.activePlayingLecture.collectAsStateWithLifecycle()
     val isPreparingVideo by viewModel.isPreparingVideo.collectAsStateWithLifecycle()
     val preparingVideoProgress by viewModel.preparingVideoProgress.collectAsStateWithLifecycle()
@@ -601,6 +615,7 @@ fun MainMedicalWorkspace(
     val examUploadProgress by viewModel.examUploadProgress.collectAsStateWithLifecycle()
     val downloadingExamIds by viewModel.downloadingExamIds.collectAsStateWithLifecycle()
     val downloadingLectureIds by viewModel.downloadingLectureIds.collectAsStateWithLifecycle()
+    val deletingLectureIds by viewModel.deletingLectureIds.collectAsStateWithLifecycle()
     val downloadProgressMap by viewModel.downloadProgressMap.collectAsStateWithLifecycle()
     val downloadStatesMap by viewModel.downloadStatesMap.collectAsStateWithLifecycle()
 
@@ -614,6 +629,21 @@ fun MainMedicalWorkspace(
     val allCourseRequestsList by viewModel.allCourseRequestsList.collectAsStateWithLifecycle()
     val centralDriveConfig by viewModel.centralDriveConfig.collectAsStateWithLifecycle()
     val isActivatingDriveVault by viewModel.isActivatingDriveVault.collectAsStateWithLifecycle()
+    val registeredDevices by viewModel.registeredDevices.collectAsStateWithLifecycle()
+    val appUpdateInfo by viewModel.appUpdateInfo.collectAsStateWithLifecycle()
+    val isPublishingAppUpdate by viewModel.isPublishingAppUpdate.collectAsStateWithLifecycle()
+    val appUpdatePublishProgress by viewModel.appUpdatePublishProgress.collectAsStateWithLifecycle()
+    val isDownloadingAppUpdate by viewModel.isDownloadingAppUpdate.collectAsStateWithLifecycle()
+    val appUpdateDownloadProgress by viewModel.appUpdateDownloadProgress.collectAsStateWithLifecycle()
+    val downloadedUpdateApkFile by viewModel.downloadedUpdateApkFile.collectAsStateWithLifecycle()
+
+    val currentAppVersionCode = remember(context) {
+        runCatching {
+            val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            PackageInfoCompat.getLongVersionCode(pkgInfo).coerceAtLeast(1L)
+        }.getOrDefault(1L)
+    }
+    var dismissedOptionalUpdateVersion by rememberSaveable { mutableStateOf(0L) }
 
     val isAdminMode = activeRole == UserRoleMode.ADMIN && isVerifiedAdmin
 
@@ -684,6 +714,37 @@ fun MainMedicalWorkspace(
         if (bannerMessage != null) {
             viewModel.clearBannerMessage()
         }
+        if (selectedTab != 0 && openedCourseId != null) {
+            viewModel.closeCourse()
+        }
+    }
+
+    val categoriesList = (categoriesState as? UiState.Success<List<Category>>)?.data ?: emptyList()
+    val openedCourse = remember(openedCourseId, categoriesList) {
+        categoriesList.firstOrNull { it.id == openedCourseId }
+    }
+
+    if (selectedTab == 0 && openedCourse != null && activePlayingLecture == null) {
+        val allLectures = (lecturesState as? UiState.Success)?.data ?: emptyList()
+        CoursePlayerScreen(
+            category = openedCourse,
+            allLectures = allLectures,
+            downloadsState = downloadsState,
+            downloadingLectureIds = downloadingLectureIds,
+            deletingLectureIds = deletingLectureIds,
+            downloadProgressMap = downloadProgressMap,
+            downloadStatesMap = downloadStatesMap,
+            isAdminMode = isAdminMode,
+            userEmail = viewModel.currentUserEmail,
+            bannerMessage = bannerMessage,
+            onDismissBanner = viewModel::clearBannerMessage,
+            onBackClick = viewModel::closeCourse,
+            onDeleteLecture = viewModel::deleteLecture,
+            onDownloadInAppOnly = viewModel::startOrResumeLectureDownload,
+            onPauseDownload = viewModel::pauseLectureDownload,
+            onCancelDownload = { lec -> viewModel.cancelLectureDownload(lec.id, lec.title) }
+        )
+        return
     }
 
     Scaffold(
@@ -1021,15 +1082,12 @@ fun MainMedicalWorkspace(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            val categoriesList = (categoriesState as? UiState.Success<List<Category>>)?.data ?: emptyList()
-
             // تبديل فوري ومباشر في 0 ملي ثانية بدون أي أنيميشن انتقالي بطيء (Zero Lag)
             when (selectedTab) {
                 0 -> LecturesLibraryScreen(
                     isAdminMode = isAdminMode,
                     categoriesState = categoriesState,
                     lecturesState = lecturesState,
-                    downloadsState = downloadsState,
                     myCourseRequestsList = myCourseRequestsList,
                     isUploadingLecture = isUploadingLecture,
                     uploadProgress = uploadProgress,
@@ -1037,21 +1095,12 @@ fun MainMedicalWorkspace(
                     onPauseUpload = viewModel::pauseLectureUpload,
                     onResumeUpload = viewModel::resumeLectureUpload,
                     onCancelUpload = viewModel::cancelLectureUpload,
-                    downloadingLectureIds = downloadingLectureIds,
-                    downloadProgressMap = downloadProgressMap,
-                    downloadStatesMap = downloadStatesMap,
-                    selectedCategoryId = selectedCategoryId,
-                    onSelectCategory = viewModel::selectCategory,
                     onAddCategory = viewModel::createCategory,
                     onUploadLecture = { title, desc, catId, catName, uri, dur, size ->
                         viewModel.uploadLecture(title, desc, catId, catName, uri, dur, size)
                     },
-                    onRequestCourseEnrollment = viewModel::requestCourseEnrollment,
-                    onDeleteLecture = viewModel::deleteLecture,
-                    onPlayLecture = viewModel::openLecturePlayer,
-                    onDownloadInAppOnly = viewModel::startOrResumeLectureDownload,
-                    onPauseDownload = viewModel::pauseLectureDownload,
-                    onCancelDownload = { lec -> viewModel.cancelLectureDownload(lec.id, lec.title) }
+                    onOpenCourse = { cat -> viewModel.openCourse(cat.id) },
+                    onRequestCourseEnrollment = viewModel::requestCourseEnrollment
                 )
 
                 1 -> ExamsScreen(
@@ -1105,7 +1154,11 @@ fun MainMedicalWorkspace(
                     onSetDirectStudentCourseAccess = viewModel::setDirectStudentCourseAccess,
                     onAddAdminEmail = viewModel::addAdminEmail,
                     onRemoveAdminEntry = viewModel::removeAdminEntry,
-                    onDeleteCategory = viewModel::deleteCategory
+                    onDeleteCategory = viewModel::deleteCategory,
+                    appUpdateInfo = appUpdateInfo,
+                    isPublishingAppUpdate = isPublishingAppUpdate,
+                    appUpdatePublishProgress = appUpdatePublishProgress,
+                    onPublishAppUpdateApk = viewModel::publishAppUpdateApk
                 )
 
                 else -> SettingsScreen(
@@ -1124,6 +1177,8 @@ fun MainMedicalWorkspace(
                     isDarkMode = isDarkMode,
                     onToggleDarkMode = onToggleDarkMode,
                     onFullDataWipe = viewModel::executeProductionCleanBoot,
+                    registeredDevices = registeredDevices,
+                    onSignOutFromAllOtherDevices = viewModel::signOutFromAllOtherDevices,
                     onSignOutClick = {
                         viewModel.prepareForSignOut()
                         signOut(
@@ -1153,4 +1208,291 @@ fun MainMedicalWorkspace(
             onDismiss = viewModel::closeLecturePlayer
         )
     }
+
+    // In-App APK Auto-Updater Dialog (Student / User View)
+    val latestUpdate = appUpdateInfo
+    val shouldShowUpdateDialog = latestUpdate != null &&
+        latestUpdate.apkDriveFileId.isNotBlank() &&
+        latestUpdate.latestVersionCode > currentAppVersionCode &&
+        (latestUpdate.forceUpdate || dismissedOptionalUpdateVersion < latestUpdate.latestVersionCode)
+
+    if (shouldShowUpdateDialog && latestUpdate != null) {
+        InAppApkUpdateDialog(
+            updateInfo = latestUpdate,
+            isDownloading = isDownloadingAppUpdate,
+            downloadProgress = appUpdateDownloadProgress,
+            downloadedApkFile = downloadedUpdateApkFile,
+            onStartDownloadClick = {
+                viewModel.startAppUpdateDownload(latestUpdate.apkDriveFileId)
+            },
+            onDismissOptional = {
+                if (!latestUpdate.forceUpdate) {
+                    dismissedOptionalUpdateVersion = latestUpdate.latestVersionCode
+                }
+            }
+        )
+    }
 }
+
+@Composable
+private fun InAppApkUpdateDialog(
+    updateInfo: AppUpdateInfo,
+    isDownloading: Boolean,
+    downloadProgress: Int,
+    downloadedApkFile: File?,
+    onStartDownloadClick: () -> Unit,
+    onDismissOptional: () -> Unit
+) {
+    val context = LocalContext.current
+    val isRobolectric = remember { Build.FINGERPRINT.equals("robolectric", ignoreCase = true) }
+    var installStatusNote by remember { mutableStateOf<String?>(null) }
+
+    val triggerApkInstall: (File) -> Unit = { apkFile ->
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !isRobolectric &&
+            !context.packageManager.canRequestPackageInstalls()
+        ) {
+            installStatusNote = "يرجى تفعيل خيار \"السماح بتثبيت التطبيقات من هذا المصدر\" ثم العودة للضغط على \"تثبيت التحديث الآن\"."
+            runCatching {
+                val settingsIntent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${context.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(settingsIntent)
+            }
+        } else {
+            runCatching {
+                val contentUri = FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    apkFile
+                )
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(contentUri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (!isRobolectric) {
+                    context.startActivity(installIntent)
+                }
+                installStatusNote = "تم فتح مثبت النظام لتحديث التطبيق مباشرة فوق النسخة الحالية."
+            }.onFailure { err ->
+                installStatusNote = "تعذر فتح مثبت الحزمة: ${err.localizedMessage ?: ""}"
+            }
+        }
+    }
+
+    LaunchedEffect(downloadedApkFile) {
+        if (downloadedApkFile != null && downloadedApkFile.exists()) {
+            triggerApkInstall(downloadedApkFile)
+        }
+    }
+
+    Dialog(
+        onDismissRequest = {
+            if (!updateInfo.forceUpdate && !isDownloading) {
+                onDismissOptional()
+            }
+        },
+        properties = DialogProperties(
+            dismissOnBackPress = !updateInfo.forceUpdate && !isDownloading,
+            dismissOnClickOutside = !updateInfo.forceUpdate && !isDownloading
+        )
+    ) {
+        Surface(
+            shape = RoundedCornerShape(26.dp),
+            color = Color(0xFFFAF7F0),
+            shadowElevation = 12.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("in_app_update_dialog")
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                // Header in Elghaliz deep green (#0F3D2E) and gold (#C9A24D)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0F3D2E))
+                        .padding(horizontal = 20.dp, vertical = 18.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(46.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFC9A24D)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SystemUpdate,
+                                contentDescription = null,
+                                tint = Color(0xFF0F3D2E),
+                                modifier = Modifier.size(26.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = "يتوفر تحديث جديد (الإصدار ${updateInfo.latestVersionName})",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color.White,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = if (updateInfo.forceUpdate) "تحديث إجباري للمنصة" else "تحديث رسمي متاح الآن",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFFC9A24D),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Surface(
+                        color = Color(0xFF0F3D2E).copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "✓ يُثبّت التحديث مباشرة فوق التطبيق الحالي دون حذف المحاضرات المحملة (.elgdrm) ودون المساس بتسجيل جهازك.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF0F3D2E),
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+
+                    if (updateInfo.releaseNotes.isNotBlank()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "ما الجديد في هذا الإصدار:",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = Color(0xFF0F3D2E),
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = updateInfo.releaseNotes,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFF2B3A34)
+                            )
+                        }
+                    }
+
+                    if (isDownloading) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "جاري تنزيل التحديث...",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color(0xFF0F3D2E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "${downloadProgress.coerceIn(0, 100)}%",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color(0xFF0F3D2E),
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.testTag("app_update_download_progress_text")
+                                )
+                            }
+                            LinearProgressIndicator(
+                                progress = { (downloadProgress.coerceIn(0, 100)) / 100f },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(9.dp)
+                                    .clip(RoundedCornerShape(50)),
+                                color = Color(0xFF0F3D2E),
+                                trackColor = Color(0xFFC9A24D).copy(alpha = 0.28f)
+                            )
+                        }
+                    }
+
+                    if (!installStatusNote.isNullOrBlank()) {
+                        Surface(
+                            color = Color(0xFFC9A24D).copy(alpha = 0.22f),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = installStatusNote ?: "",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFF0F3D2E),
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (!updateInfo.forceUpdate && !isDownloading) {
+                            OutlinedButton(
+                                onClick = onDismissOptional,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("dismiss_optional_update_button")
+                            ) {
+                                Text(
+                                    text = "لاحقاً",
+                                    color = Color(0xFF0F3D2E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                if (downloadedApkFile != null && downloadedApkFile.exists()) {
+                                    triggerApkInstall(downloadedApkFile)
+                                } else {
+                                    onStartDownloadClick()
+                                }
+                            },
+                            enabled = !isDownloading,
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF0F3D2E),
+                                contentColor = Color.White
+                            ),
+                            modifier = Modifier
+                                .weight(1.4f)
+                                .height(48.dp)
+                                .testTag("start_app_update_download_button")
+                        ) {
+                            Text(
+                                text = when {
+                                    isDownloading -> "جاري التنزيل (${downloadProgress.coerceIn(0, 100)}%)..."
+                                    downloadedApkFile != null && downloadedApkFile.exists() -> "تثبيت التحديث الآن"
+                                    else -> "تحديث الآن"
+                                },
+                                color = Color(0xFFC9A24D),
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

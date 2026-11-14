@@ -99,6 +99,8 @@ fun SettingsScreen(
     isDarkMode: Boolean = false,
     onToggleDarkMode: () -> Unit = {},
     onFullDataWipe: () -> Unit = {},
+    registeredDevices: List<String> = listOf("Android_Primary"),
+    onSignOutFromAllOtherDevices: () -> Unit = {},
     onSignOutClick: () -> Unit
 ) {
     SettingsScreen(
@@ -114,7 +116,9 @@ fun SettingsScreen(
         isDarkTheme = isDarkMode,
         onToggleDarkTheme = { onToggleDarkMode() },
         onSwitchRoleMode = {},
-        onSignOut = onSignOutClick
+        onSignOut = onSignOutClick,
+        registeredDevices = registeredDevices,
+        onSignOutFromAllOtherDevices = onSignOutFromAllOtherDevices
     )
 }
 
@@ -625,7 +629,7 @@ fun SettingsScreen(
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
-                    // 2-Device Limit Protection & Sign Out From All Devices
+                    // Strict Permanent 1-Device Lock Info
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -642,40 +646,13 @@ fun SettingsScreen(
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(10.dp))
-                            Column {
-                                Text(
-                                    text = "الأجهزة المرتبطة بالحساب (${registeredDevices.size}/2 كحد أقصى)",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "ربط الحساب بجهازين كحد أقصى لمنع مشاركة الحساب وتنتهي صلاحية التنزيلات بانتهاء الاشتراك",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
+                            Text(
+                                text = "حماية الحساب: مرتبط بهذا الجهاز فقط (1/1 — جهاز واحد لكل إيميل)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
-                    }
-
-                    OutlinedButton(
-                        onClick = onSignOutFromAllOtherDevices,
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(44.dp)
-                            .testTag("sign_out_all_devices_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PhonelinkErase,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "تسجيل الخروج من كل الأجهزة الأخرى",
-                            fontWeight = FontWeight.Bold
-                        )
                     }
                 }
             }

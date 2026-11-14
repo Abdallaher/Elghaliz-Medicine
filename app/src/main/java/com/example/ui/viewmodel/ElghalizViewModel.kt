@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.formatArabicUserFriendlyError
 import com.example.data.model.AdminEntry
+import com.example.data.model.AppUpdateInfo
 import com.example.data.model.Category
 import com.example.data.model.CentralDriveConfig
 import com.example.data.model.CourseNotification
@@ -118,6 +119,9 @@ class ElghalizViewModel(
     private val _selectedCategoryId = MutableStateFlow<String?>(null)
     val selectedCategoryId: StateFlow<String?> = _selectedCategoryId.asStateFlow()
 
+    private val _openedCourseId = MutableStateFlow<String?>(null)
+    val openedCourseId: StateFlow<String?> = _openedCourseId.asStateFlow()
+
     private val _activePlayingLecture = MutableStateFlow<Lecture?>(null)
     val activePlayingLecture: StateFlow<Lecture?> = _activePlayingLecture.asStateFlow()
 
@@ -164,6 +168,11 @@ class ElghalizViewModel(
     private val _downloadingLectureIds = MutableStateFlow<Set<String>>(emptySet())
     val downloadingLectureIds: StateFlow<Set<String>> = _downloadingLectureIds.asStateFlow()
 
+    private val _deletingLectureIds = MutableStateFlow<Set<String>>(emptySet())
+    val deletingLectureIds: StateFlow<Set<String>> = _deletingLectureIds.asStateFlow()
+
+    private val _locallyDeletedLectureIds = MutableStateFlow<Set<String>>(emptySet())
+
     private val _downloadProgressMap = MutableStateFlow<Map<String, Int>>(emptyMap())
     val downloadProgressMap: StateFlow<Map<String, Int>> = _downloadProgressMap.asStateFlow()
 
@@ -204,11 +213,42 @@ class ElghalizViewModel(
     private val _isActivatingDriveVault = MutableStateFlow(false)
     val isActivatingDriveVault: StateFlow<Boolean> = _isActivatingDriveVault.asStateFlow()
 
+    private val _appUpdateInfo = MutableStateFlow<AppUpdateInfo?>(null)
+    val appUpdateInfo: StateFlow<AppUpdateInfo?> = _appUpdateInfo.asStateFlow()
+
+    private val _isPublishingAppUpdate = MutableStateFlow(false)
+    val isPublishingAppUpdate: StateFlow<Boolean> = _isPublishingAppUpdate.asStateFlow()
+
+    private val _appUpdatePublishProgress = MutableStateFlow(0)
+    val appUpdatePublishProgress: StateFlow<Int> = _appUpdatePublishProgress.asStateFlow()
+
+    private val _isDownloadingAppUpdate = MutableStateFlow(false)
+    val isDownloadingAppUpdate: StateFlow<Boolean> = _isDownloadingAppUpdate.asStateFlow()
+
+    private val _appUpdateDownloadProgress = MutableStateFlow(0)
+    val appUpdateDownloadProgress: StateFlow<Int> = _appUpdateDownloadProgress.asStateFlow()
+
+    private val _downloadedUpdateApkFile = MutableStateFlow<File?>(null)
+    val downloadedUpdateApkFile: StateFlow<File?> = _downloadedUpdateApkFile.asStateFlow()
+
+    private val _registeredDevices = MutableStateFlow<List<String>>(
+        if (appContext != null) {
+            SessionPreferences.registerAndGetActiveDevices(appContext, currentUserId)
+        } else {
+            listOf("Android_Primary")
+        }
+    )
+    val registeredDevices: StateFlow<List<String>> = _registeredDevices.asStateFlow()
+
+    private val _isDeviceLimitExceeded = MutableStateFlow(false)
+    val isDeviceLimitExceeded: StateFlow<Boolean> = _isDeviceLimitExceeded.asStateFlow()
+
     private var studentStatusJob: Job? = null
     private var myCourseRequestsJob: Job? = null
     private var adminListsJob: Job? = null
     private var notificationsJob: Job? = null
     private var driveConfigJob: Job? = null
+    private var appUpdateJob: Job? = null
 
     private val _isSignedOut = MutableStateFlow(false)
 
@@ -258,20 +298,23 @@ class ElghalizViewModel(
             }
         )
 
-    val lecturesState: StateFlow<UiState<List<Lecture>>> = canAccessProtectedContent
-        .flatMapLatest { allowed ->
+    val lecturesState: StateFlow<UiState<List<Lecture>>> = combine(
+        canAccessProtectedContent,
+        _locallyDeletedLectureIds
+    ) { allowed, deletedIds -> allowed to deletedIds }
+        .flatMapLatest { (allowed, deletedIds) ->
             if (!allowed || Firebase.auth.currentUser == null) {
                 flowOf(UiState.Success(emptyList()))
             } else {
                 repository.observeLectures()
                     .map<List<Lecture>, UiState<List<Lecture>>> { list ->
-                        if (appContext != null && !isRobolectricRuntime && list.isNotEmpty()) {
-                            SessionPreferences.saveLocalLecturesCache(appContext, list)
-                        }
-                        val effectiveList = if (list.isEmpty() && appContext != null && !isRobolectricRuntime) {
-                            SessionPreferences.getLocalLecturesCache(appContext)
-                        } else {
+                        val effectiveList = if (deletedIds.isEmpty()) {
                             list
+                        } else {
+                            list.filterNot { deletedIds.contains(it.id) }
+                        }
+                        if (appContext != null && !isRobolectricRuntime) {
+                            SessionPreferences.saveLocalLecturesCache(appContext, effectiveList)
                         }
                         UiState.Success(effectiveList)
                     }
@@ -283,7 +326,9 @@ class ElghalizViewModel(
                         val rootError = firestoreError ?: error
                         Log.w(TAG, "Error observing lectures", rootError)
                         if (appContext != null && !isRobolectricRuntime) {
-                            emit(UiState.Success(SessionPreferences.getLocalLecturesCache(appContext)))
+                            val cached = SessionPreferences.getLocalLecturesCache(appContext)
+                                .filterNot { deletedIds.contains(it.id) }
+                            emit(UiState.Success(cached))
                         } else {
                             emit(UiState.Error(rootError.message ?: "تعذر تحميل مكتبة المحاضرات"))
                         }
@@ -477,12 +522,15 @@ class ElghalizViewModel(
                 startObservingSmartCourseNotifications()
             }
 
+            val currentDeviceId = appContext?.let { SessionPreferences.getCurrentDeviceId(it) }.orEmpty()
             val regResult = repository.ensureStudentRequestRegistered(
                 rawEmail = currentUserEmail,
-                rawDisplayName = currentUserDisplayName
+                rawDisplayName = currentUserDisplayName,
+                currentDeviceId = currentDeviceId
             )
             regResult.onSuccess { req ->
                 _studentApprovalStatus.value = req.status
+                evaluateServerDeviceLimit(req.registeredDeviceIds)
                 if (appContext != null && !isRobolectricRuntime) {
                     SessionPreferences.saveVerifiedAccountState(
                         context = appContext,
@@ -505,6 +553,46 @@ class ElghalizViewModel(
         }
     }
 
+    private fun evaluateServerDeviceLimit(serverDeviceIds: List<String>) {
+        if (_isVerifiedAdmin.value) {
+            _isDeviceLimitExceeded.value = false
+            return
+        }
+        val currentDeviceId = appContext?.let { SessionPreferences.getCurrentDeviceId(it) }.orEmpty()
+        val distinctDevices = serverDeviceIds.filter { it.isNotBlank() }.distinct()
+        if (distinctDevices.isNotEmpty()) {
+            _registeredDevices.value = distinctDevices.take(1)
+            if (appContext != null) {
+                SessionPreferences.syncRegisteredDevicesFromServer(appContext, currentUserId, distinctDevices.take(1))
+            }
+        }
+        if (currentDeviceId.isNotBlank()) {
+            if (distinctDevices.isNotEmpty() && !distinctDevices.contains(currentDeviceId)) {
+                _isDeviceLimitExceeded.value = true
+                _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            } else if (distinctDevices.contains(currentDeviceId)) {
+                _isDeviceLimitExceeded.value = false
+            } else {
+                _isDeviceLimitExceeded.value = false
+                viewModelScope.launch {
+                    repository.verifyOrRegisterStudentDevice(currentDeviceId).onSuccess { (allowed, updatedList) ->
+                        _registeredDevices.value = updatedList.take(1)
+                        _isDeviceLimitExceeded.value = !allowed
+                        if (!allowed) {
+                            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+                        } else if (appContext != null) {
+                            SessionPreferences.syncRegisteredDevicesFromServer(appContext, currentUserId, updatedList.take(1))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun signOutFromAllOtherDevices() {
+        // Strict permanent 1-device lock per email: device unlinking is permanently disabled
+    }
+
     private fun startObservingMyStudentStatus() {
         studentStatusJob?.cancel()
         if (Firebase.auth.currentUser == null || _isSignedOut.value) return
@@ -517,6 +605,7 @@ class ElghalizViewModel(
                     if (req != null) {
                         val prev = _studentApprovalStatus.value
                         _studentApprovalStatus.value = req.status
+                        evaluateServerDeviceLimit(req.registeredDeviceIds)
                         if (appContext != null && !isRobolectricRuntime) {
                             SessionPreferences.saveVerifiedAccountState(
                                 context = appContext,
@@ -887,13 +976,36 @@ class ElghalizViewModel(
         _selectedCategoryId.value = categoryId
     }
 
+    fun openCourse(categoryId: String) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
+        _selectedCategoryId.value = categoryId
+        _openedCourseId.value = categoryId
+    }
+
+    fun closeCourse() {
+        _openedCourseId.value = null
+    }
+
     fun openLecturePlayer(lecture: Lecture) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _activePlayingLecture.value = null
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
         _isPreparingVideo.value = false
         _preparingVideoProgress.value = 100
         _activePlayingLecture.value = lecture
     }
 
     fun openDownloadedLecturePlayer(download: OfflineDownload) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _activePlayingLecture.value = null
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
         val matchingLecture = ((lecturesState.value as? UiState.Success)?.data ?: emptyList())
             .firstOrNull { it.id == download.lectureId }
         val initialLecture = Lecture(
@@ -944,6 +1056,9 @@ class ElghalizViewModel(
                 .onSuccess {
                     if (_selectedCategoryId.value == categoryId) {
                         _selectedCategoryId.value = null
+                    }
+                    if (_openedCourseId.value == categoryId) {
+                        _openedCourseId.value = null
                     }
                     _bannerMessage.value = "تم حذف التصنيف الدراسي"
                 }
@@ -1137,13 +1252,32 @@ class ElghalizViewModel(
     }
 
     fun deleteLecture(lectureId: String) {
+        if (lectureId.isBlank() || _deletingLectureIds.value.contains(lectureId)) return
+        _deletingLectureIds.value = _deletingLectureIds.value + lectureId
         viewModelScope.launch {
             repository.deleteLecture(lectureId)
                 .onSuccess {
+                    _deletingLectureIds.value = _deletingLectureIds.value - lectureId
+                    _locallyDeletedLectureIds.value = _locallyDeletedLectureIds.value + lectureId
+                    if (_activePlayingLecture.value?.id == lectureId) {
+                        closeLecturePlayer()
+                    }
+                    activeDownloadJobs.remove(lectureId)?.cancel()
+                    pausedLectureIds.remove(lectureId)
+                    _downloadingLectureIds.value = _downloadingLectureIds.value - lectureId
+                    _downloadProgressMap.value = _downloadProgressMap.value - lectureId
+                    _downloadStatesMap.value = _downloadStatesMap.value - lectureId
+                    if (appContext != null) {
+                        val updatedCache = SessionPreferences.getLocalLecturesCache(appContext)
+                            .filterNot { it.id == lectureId }
+                        SessionPreferences.saveLocalLecturesCache(appContext, updatedCache)
+                    }
                     _bannerMessage.value = "تم حذف المحاضرة من المكتبة"
                 }
                 .onFailure { err ->
-                    _bannerMessage.value = err.localizedMessage ?: "تعذر حذف المحاضرة"
+                    _deletingLectureIds.value = _deletingLectureIds.value - lectureId
+                    val reason = err.localizedMessage?.takeIf { it.isNotBlank() } ?: "خطأ في الصلاحيات أو الاتصال بالخادم"
+                    _bannerMessage.value = "تعذر حذف المحاضرة: $reason"
                 }
         }
     }
@@ -1152,11 +1286,27 @@ class ElghalizViewModel(
     // Advanced Download Engine (0%-100% + Pause + Resume + Cancel + DRM AES-256)
     // =========================================================================
 
+    fun downloadLectureInApp(lecture: Lecture) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
+        startOrResumeLectureDownload(lecture)
+    }
+
     fun downloadLectureInAppOnly(lecture: Lecture) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
         startOrResumeLectureDownload(lecture)
     }
 
     fun startOrResumeLectureDownload(lecture: Lecture) {
+        if (!_isVerifiedAdmin.value && _isDeviceLimitExceeded.value) {
+            _bannerMessage.value = DEVICE_LIMIT_EXCEEDED_ALERT_AR
+            return
+        }
         val currentState = _downloadStatesMap.value[lecture.id]
         if (currentState?.status == DownloadTaskStatus.DOWNLOADING) return
 
@@ -1595,20 +1745,99 @@ class ElghalizViewModel(
         }
     }
 
+    private fun startObservingAppUpdateInfo() {
+        appUpdateJob?.cancel()
+        if (Firebase.auth.currentUser == null || _isSignedOut.value) return
+        appUpdateJob = viewModelScope.launch {
+            repository.observeAppUpdateInfo()
+                .catch { error -> Log.w(TAG, "Failed to observe app update info", error) }
+                .collect { info -> _appUpdateInfo.value = info }
+        }
+    }
+
+    fun publishAppUpdateApk(
+        apkSourceUri: String,
+        latestVersionCode: Long,
+        latestVersionName: String,
+        releaseNotes: String,
+        forceUpdate: Boolean
+    ) {
+        if (_isPublishingAppUpdate.value) return
+        viewModelScope.launch {
+            _isPublishingAppUpdate.value = true
+            _appUpdatePublishProgress.value = 1
+            repository.publishAppUpdateApk(
+                apkSourceUri = apkSourceUri,
+                latestVersionCode = latestVersionCode,
+                latestVersionName = latestVersionName,
+                releaseNotes = releaseNotes,
+                forceUpdate = forceUpdate,
+                onProgress = { pct ->
+                    _appUpdatePublishProgress.value = pct.coerceIn(1, 100)
+                }
+            ).onSuccess { publishedInfo ->
+                _isPublishingAppUpdate.value = false
+                _appUpdatePublishProgress.value = 100
+                _appUpdateInfo.value = publishedInfo
+                _bannerMessage.value = "تم رفع ونشر تحديث التطبيق (الإصدار ${publishedInfo.latestVersionName}) بنجاح لجميع الطلاب!"
+            }.onFailure { err ->
+                _isPublishingAppUpdate.value = false
+                _appUpdatePublishProgress.value = 0
+                _bannerMessage.value = formatArabicUserFriendlyError(err)
+            }
+        }
+    }
+
+    fun startAppUpdateDownload(apkDriveFileId: String) {
+        if (_isDownloadingAppUpdate.value) return
+        val cleanId = apkDriveFileId.trim().ifBlank { _appUpdateInfo.value?.apkDriveFileId.orEmpty() }
+        if (cleanId.isBlank()) {
+            _bannerMessage.value = "ملف التحديث غير متوفر حالياً على السحابة"
+            return
+        }
+        viewModelScope.launch {
+            _isDownloadingAppUpdate.value = true
+            _appUpdateDownloadProgress.value = 1
+            _downloadedUpdateApkFile.value = null
+            repository.downloadAppUpdateApkToCache(
+                apkDriveFileId = cleanId,
+                onProgress = { pct ->
+                    _appUpdateDownloadProgress.value = pct.coerceIn(1, 100)
+                }
+            ).onSuccess { apkFile ->
+                _isDownloadingAppUpdate.value = false
+                _appUpdateDownloadProgress.value = 100
+                _downloadedUpdateApkFile.value = apkFile
+            }.onFailure { err ->
+                _isDownloadingAppUpdate.value = false
+                _appUpdateDownloadProgress.value = 0
+                _bannerMessage.value = formatArabicUserFriendlyError(err)
+            }
+        }
+    }
+
+    fun clearDownloadedUpdateApkFile() {
+        _downloadedUpdateApkFile.value = null
+    }
+
     fun prepareForSignOut() {
         _isSignedOut.value = true
         _isVerifiedAdmin.value = false
         _isPrimaryAdmin.value = false
+        _openedCourseId.value = null
         _studentApprovalStatus.value = "loading"
         studentStatusJob?.cancel()
         myCourseRequestsJob?.cancel()
         adminListsJob?.cancel()
         notificationsJob?.cancel()
         driveConfigJob?.cancel()
+        appUpdateJob?.cancel()
     }
 
     private companion object {
         const val TAG = "ElghalizVM"
         const val STOP_TIMEOUT_MILLIS = 5000L
+        const val DEVICE_LIMIT_EXCEEDED_ALERT_AR =
+            "هذا الإيميل مرتبط بجهاز آخر بالفعل (يُسمح بجهاز واحد فقط لكل إيميل)"
     }
 }

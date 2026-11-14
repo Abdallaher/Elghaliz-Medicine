@@ -16,6 +16,23 @@ enum class OperationType(val value: String) {
     WRITE("write"),
 }
 
+fun maskEmailForLog(rawEmail: String?): String {
+    if (rawEmail.isNullOrBlank()) return "redacted"
+    val clean = rawEmail.trim()
+    val atIdx = clean.indexOf('@')
+    if (atIdx <= 0) return "${clean.take(2)}***"
+    val localPart = clean.substring(0, atIdx)
+    val domainPart = clean.substring(atIdx)
+    val visiblePrefix = localPart.take(2).ifEmpty { "*" }
+    return "$visiblePrefix***$domainPart"
+}
+
+fun maskUidForLog(rawUid: String?): String {
+    if (rawUid.isNullOrBlank()) return "redacted"
+    val clean = rawUid.trim()
+    return "${clean.take(4)}***"
+}
+
 fun handleFirestoreError(exception: Throwable, operationType: OperationType, path: String?): String {
     val causes = generateSequence(exception) { it.cause }
     val rootError = causes.firstOrNull { it is FirebaseFirestoreException }
@@ -32,13 +49,13 @@ fun handleFirestoreError(exception: Throwable, operationType: OperationType, pat
     val providerInfoList = currentUser?.providerData?.map { provider ->
         JSONObject().apply {
             put("providerId", provider.providerId)
-            put("email", provider.email)
+            put("email", maskEmailForLog(provider.email))
         }
     } ?: emptyList()
 
     val authInfoJson = JSONObject().apply {
-        put("userId", currentUser?.uid)
-        put("email", currentUser?.email)
+        put("userId", maskUidForLog(currentUser?.uid))
+        put("email", maskEmailForLog(currentUser?.email))
         put("emailVerified", currentUser?.isEmailVerified)
         put("tenantId", currentUser?.tenantId)
         put("providerInfo", JSONArray(providerInfoList))
