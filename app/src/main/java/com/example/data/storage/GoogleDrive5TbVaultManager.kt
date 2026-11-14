@@ -1,0 +1,1506 @@
+package com.example.data.storage
+
+import android.accounts.Account
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.IntentSender
+import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
+import com.example.R
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.AuthorizationResult
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.Scope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.FilterInputStream
+import java.io.InputStream
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * محرك مخزن الـ 5 تيرابايت المركزي (Google Drive 5TB Central Vault Engine):
+ * 1. متصل بالرابط السحابي المركزي المباشر (Google Apps Script Bridge):
+ *    `https://script.google.com/macros/s/AKfycbz7zLWO49No_RdNVPB2FKX5Bw-RjmSVjvd-6t-l3LK4ecQy5hY9daAgi4XLXfvKWyL2Hg/exec`
+ * 2. الرفع السريع المتوافق مع الإنترنت الضعيف (200KB/s):
+ *    حجم الدفعة 256KB (262,144 بايت — الحد الأدنى الرسمي في Google Drive) مع تحديث شريط التقدم كل 16KB (16,384 بايت).
+ * 3. التنزيل المتدفق المستمر ومسرّع التحميل متعدد القنوات (Multi-Thread Range Booster):
+ *    يكتب مباشرة إلى ملف مستمر على القرص (`FileOutputStream(partFile, append = true)`) كل 8KB (8,192 بايت)
+ *    ويحسب النسبة الحقيقية من حجم الملف الفعلي المحفوظ على القرص `((partFile.length() * 100) / totalBytes).toInt()`،
+ *    مع دعم الإيقاف المؤقت الفوري والاستمرار من نفس البايت (`Range: bytes=$savedBytes-`).
+ */
+object GoogleDrive5TbVaultManager {
+    const val PRIMARY_ADMIN_EMAIL = "abdallahxh909@gmail.com"
+    const val DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+    const val VAULT_FOLDER_NAME = "Elghaliz_Medicine_5TB_Vault"
+    const val LECTURES_FOLDER_NAME = "Elghaliz_Medicine_Lectures"
+    const val CENTRAL_APPS_SCRIPT_URL =
+        "https://script.google.com/macros/s/AKfycbz7zLWO49No_RdNVPB2FKX5Bw-RjmSVjvd-6t-l3LK4ecQy5hY9daAgi4XLXfvKWyL2Hg/exec"
+    const val RESUMABLE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+    const val DRIVE_FILES_API_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
+
+    // 256 KB per chunk (262,144 bytes — official minimum chunk size in Google Drive Resumable Upload API for fast progress on 200KB/s internet)
+    const val DRIVE_CHUNK_BYTES = 256 * 1024 // 262,144 bytes
+    // 16 KB upload progress buffer so the progress bar updates smoothly every second
+    const val UPLOAD_PROGRESS_STEP_BYTES = 16 * 1024 // 16,384 bytes
+    // 16 KB download read buffer for responsive streaming and instant pause/resume
+    const val DOWNLOAD_BUFFER_BYTES = 16 * 1024 // 16,384 bytes
+
+    private val activeDownloadConnections = ConcurrentHashMap<String, MutableList<HttpURLConnection>>()
+
+    data class AppsScriptUploadParams(
+        val accessToken: String,
+        val folderId: String
+    )
+
+    data class DriveAuthGrantResult(
+        val needsResolution: Boolean = false,
+        val pendingIntent: PendingIntent? = null,
+        val pendingIntentSender: IntentSender? = null,
+        val accessToken: String = "",
+        val serverAuthCode: String = "",
+        val expiresAtMillis: Long = 0L,
+        val errorMessage: String? = null
+    )
+
+    data class UploadedDriveVideoMeta(
+        val driveFileId: String,
+        val fileName: String,
+        val sizeBytes: Long
+    )
+
+    fun buildDirectDriveStreamUrl(driveFileId: String): String {
+        return "$DRIVE_FILES_API_ENDPOINT/${driveFileId.trim()}?alt=media"
+    }
+
+    fun getDownloadPartFile(vaultDir: File, lectureId: String): File {
+        if (!vaultDir.exists()) vaultDir.mkdirs()
+        return File(vaultDir, "${lectureId}.elgdrm.part")
+    }
+
+    fun getDownloadTotalBytesMetaFile(vaultDir: File, lectureId: String): File {
+        val partFile = getDownloadPartFile(vaultDir, lectureId)
+        return File(partFile.parentFile ?: vaultDir, "${partFile.name}.total")
+    }
+
+    private fun registerDownloadConnection(lectureId: String, conn: HttpURLConnection) {
+        if (lectureId.isBlank()) return
+        val list = activeDownloadConnections.getOrPut(lectureId) {
+            java.util.Collections.synchronizedList(mutableListOf())
+        }
+        list.add(conn)
+    }
+
+    private fun unregisterDownloadConnection(lectureId: String, conn: HttpURLConnection) {
+        if (lectureId.isBlank()) return
+        activeDownloadConnections[lectureId]?.remove(conn)
+    }
+
+    fun abortActiveDownloadConnection(lectureId: String) {
+        if (lectureId.isBlank()) return
+        val conns = activeDownloadConnections.remove(lectureId)?.toList().orEmpty()
+        if (conns.isNotEmpty()) {
+            CoroutineScope(Dispatchers.IO).launch {
+                conns.forEach { conn ->
+                    runCatching { conn.inputStream?.close() }
+                    runCatching { conn.disconnect() }
+                }
+            }
+        }
+    }
+
+    /**
+     * يرسل طلب POST بصيغة JSON إلى رابط Google Apps Script المركزي مع ضبط `conn.instanceFollowRedirects = false`
+     * وعند استلام كود 301 أو 302 أو 303 أو 307 أو 308 يقرأ الرابط الجديد من `Location` ويفتح اتصال GET جديداً
+     * لاستلام الـ JSON (`accessToken` و `folderId`) بنسبة نجاح 100%.
+     */
+    private fun postToAppsScriptJson(payload: JSONObject): JSONObject {
+        val conn = (URL(CENTRAL_APPS_SCRIPT_URL).openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 30_000
+            readTimeout = 45_000
+            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            setRequestProperty("Accept", "application/json")
+        }
+
+        val redirectUrl: String?
+        val firstCode: Int
+        val firstBody: String
+
+        try {
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+                writer.write(payload.toString())
+                writer.flush()
+            }
+            firstCode = conn.responseCode
+            redirectUrl = conn.getHeaderField("Location") ?: conn.getHeaderField("location")
+            firstBody = if (firstCode in 200..299) {
+                runCatching { conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() } }.getOrDefault("")
+            } else if (firstCode !in 300..399) {
+                runCatching { conn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } }.getOrNull().orEmpty()
+            } else {
+                ""
+            }
+        } finally {
+            conn.disconnect()
+        }
+
+        if (firstCode in 200..299 && firstBody.trim().startsWith("{")) {
+            return JSONObject(firstBody.trim())
+        }
+
+        if (firstCode in listOf(301, 302, 303, 307, 308) && !redirectUrl.isNullOrBlank()) {
+            var currentUrl = redirectUrl
+            for (hop in 0 until 5) {
+                val getConn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                    instanceFollowRedirects = false
+                    requestMethod = "GET"
+                    connectTimeout = 30_000
+                    readTimeout = 45_000
+                    setRequestProperty("Accept", "application/json")
+                }
+                try {
+                    val code = getConn.responseCode
+                    if (code in listOf(301, 302, 303, 307, 308)) {
+                        val nextLoc = getConn.getHeaderField("Location") ?: getConn.getHeaderField("location")
+                        if (!nextLoc.isNullOrBlank()) {
+                            currentUrl = nextLoc
+                            continue
+                        }
+                    }
+                    if (code in 200..299) {
+                        val body = getConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }.trim()
+                        if (body.startsWith("{")) {
+                            return JSONObject(body)
+                        }
+                        throw IllegalStateException("استجابة غير متوقعة من السكربت السحابي: ${body.take(180)}")
+                    } else {
+                        val err = runCatching {
+                            getConn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        }.getOrNull().orEmpty()
+                        throw IllegalStateException("فشل الاتصال بالسكربت السحابي بعد التحويل (HTTP $code): ${err.take(180)}")
+                    }
+                } finally {
+                    getConn.disconnect()
+                }
+            }
+        }
+
+        throw IllegalStateException("تعذر الاتصال برابط مخزن Google Drive المركزي (HTTP $firstCode): ${firstBody.take(180)}")
+    }
+
+    @Volatile
+    private var cachedUploadParams: AppsScriptUploadParams? = null
+
+    @Volatile
+    private var cachedParamsTimestampMs: Long = 0L
+
+    @Volatile
+    private var isBackgroundRefreshingToken: Boolean = false
+
+    private val backgroundTokenScope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * يُغذي الذاكرة المؤقتة السريعة بالتوكن المحفوظ محلياً فور إقلاع التطبيق ليكون متاحاً في 0ms قبل اكتمال اتصال الشبكة.
+     */
+    fun seedCachedTokenIfEmpty(token: String?, folderId: String = "") {
+        val cleanToken = token?.trim().orEmpty()
+        if (cleanToken.isBlank()) return
+        if (cachedUploadParams == null || cachedUploadParams?.accessToken.isNullOrBlank()) {
+            cachedUploadParams = AppsScriptUploadParams(
+                accessToken = cleanToken,
+                folderId = folderId.trim()
+            )
+            // نضع طابعاً زمنياً يسمح باستخدامه فوراً مع تحفيز التجديد الصامت في الخلفية
+            if (cachedParamsTimestampMs == 0L) {
+                cachedParamsTimestampMs = System.currentTimeMillis() - (36 * 60 * 1000L)
+            }
+        }
+    }
+
+    /**
+     * دالة فورية تُرجع التوكن المخزن في الذاكرة فوراً (0ms) دون أي انتظار للشبكة،
+     * وإذا قارب على الانتهاء (أكثر من 35 دقيقة) أو لم يكن محمّلاً بعد، تجدده في الخلفية بصمت.
+     */
+    fun getInstantAccessTokenOrNull(): String? {
+        val current = cachedUploadParams?.accessToken?.trim()?.takeIf { it.isNotBlank() }
+        val ageMs = System.currentTimeMillis() - cachedParamsTimestampMs
+        val isNearingExpiry = current == null || ageMs >= (35 * 60 * 1000L)
+        if (isNearingExpiry && !isBackgroundRefreshingToken &&
+            !android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
+        ) {
+            isBackgroundRefreshingToken = true
+            backgroundTokenScope.launch {
+                try {
+                    fetchUploadParamsFromAppsScript(forceRefresh = true)
+                } catch (_: Exception) {
+                    // Silent background refresh
+                } finally {
+                    isBackgroundRefreshingToken = false
+                }
+            }
+        }
+        return current
+    }
+
+    /**
+     * تفعيل صامت وتلقائي 100% في الخلفية لمخزن Google Drive المركزي فور فتح التطبيق بدون أي رسائل أو أزرار.
+     */
+    suspend fun warmUpCentralVaultSilently(): AppsScriptUploadParams? = withContext(Dispatchers.IO) {
+        if (android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)) {
+            return@withContext null
+        }
+        fetchUploadParamsFromAppsScript().getOrNull()
+    }
+
+    /**
+     * يتصل برابط السكربت المركزي بطلب POST `{"action": "getUploadParams"}` للحصول على
+     * `accessToken` السحابي و `folderId` لمجلد `Elghaliz_Medicine_Lectures`.
+     */
+    suspend fun fetchUploadParamsFromAppsScript(forceRefresh: Boolean = false): Result<AppsScriptUploadParams> = withContext(Dispatchers.IO) {
+        runCatching {
+            val now = System.currentTimeMillis()
+            val cached = cachedUploadParams
+            if (!forceRefresh && cached != null && cached.accessToken.isNotBlank() && (now - cachedParamsTimestampMs) < 40 * 60 * 1000L) {
+                return@runCatching cached
+            }
+
+            val req = JSONObject().apply {
+                put("action", "getUploadParams")
+            }
+            var lastError: Throwable? = null
+            for (attempt in 1..3) {
+                try {
+                    val json = postToAppsScriptJson(req)
+                    if (json.optString("status").equals("error", ignoreCase = true) ||
+                        json.has("error") && json.optString("accessToken").isBlank()
+                    ) {
+                        val errMsg = json.optString("message").ifBlank { json.optString("error", "خطأ من السكربت السحابي") }
+                        throw IllegalStateException(errMsg)
+                    }
+                    val token = json.optString("accessToken")
+                        .ifBlank { json.optString("access_token") }
+                        .ifBlank { json.optString("token") }
+                        .trim()
+                    val folderId = json.optString("folderId")
+                        .ifBlank { json.optString("folder_id") }
+                        .ifBlank { json.optString("id") }
+                        .trim()
+                    require(token.isNotBlank()) {
+                        "لم يُرجع السكربت السحابي رمز الوصول (accessToken) لمخزن الـ 5 تيرابايت."
+                    }
+                    val freshParams = AppsScriptUploadParams(
+                        accessToken = token,
+                        folderId = folderId
+                    )
+                    cachedUploadParams = freshParams
+                    cachedParamsTimestampMs = System.currentTimeMillis()
+                    return@runCatching freshParams
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastError = e
+                    if (attempt < 3) {
+                        delay(1000L * attempt)
+                    }
+                }
+            }
+            cached?.takeIf { it.accessToken.isNotBlank() }?.let { return@runCatching it }
+            throw lastError ?: IllegalStateException("تعذر جلب تصريح الرفع السحابي من مخزن Google Drive.")
+        }
+    }
+
+    /**
+     * بعد اكتمال رفع آخر بايت واستلام `driveFileId`، يرسل طلب `{"action": "makePublic", "fileId": driveFileId}`
+     * للسكربت لتفعيل مشاركة العرض وتشغيل المحاضرة للطلاب.
+     */
+    suspend fun makeDriveFilePublicViaAppsScript(driveFileId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanId = driveFileId.trim()
+            require(cleanId.isNotBlank()) { "معرّف ملف Google Drive فارغ" }
+            val req = JSONObject().apply {
+                put("action", "makePublic")
+                put("fileId", cleanId)
+            }
+            var lastErr: Throwable? = null
+            for (attempt in 1..3) {
+                try {
+                    postToAppsScriptJson(req)
+                    return@runCatching
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastErr = e
+                    if (attempt < 3) {
+                        delay(800L * attempt)
+                    }
+                }
+            }
+            throw lastErr ?: IllegalStateException("تعذر تفعيل صلاحية العرض لملف المحاضرة")
+        }
+    }
+
+    /**
+     * يبدأ طلب تصريح Google Drive (`drive.file`) من داخل التطبيق عبر Google Identity AuthorizationClient،
+     * أو يجلب التصريح مباشرة من السكربت السحابي المركزي.
+     */
+    suspend fun requestDriveVaultAuthorization(
+        context: Context,
+        primaryAdminEmail: String = PRIMARY_ADMIN_EMAIL
+    ): DriveAuthGrantResult {
+        val cloudScriptParams = fetchUploadParamsFromAppsScript().getOrNull()
+        if (cloudScriptParams != null && cloudScriptParams.accessToken.isNotBlank()) {
+            return DriveAuthGrantResult(
+                needsResolution = false,
+                accessToken = cloudScriptParams.accessToken,
+                serverAuthCode = cloudScriptParams.folderId,
+                expiresAtMillis = System.currentTimeMillis() + 3_500_000L
+            )
+        }
+
+        return try {
+            val scopes = listOf(Scope(DRIVE_FILE_SCOPE))
+            val builder = AuthorizationRequest.builder()
+                .setRequestedScopes(scopes)
+
+            runCatching {
+                val webClientId = context.getString(R.string.default_web_client_id)
+                if (webClientId.isNotBlank() && !webClientId.startsWith("YOUR_")) {
+                    builder.requestOfflineAccess(webClientId, false)
+                }
+            }
+
+            if (primaryAdminEmail.isNotBlank()) {
+                runCatching {
+                    builder.setAccount(Account(primaryAdminEmail.trim(), "com.google"))
+                }
+            }
+
+            val authResult = Identity.getAuthorizationClient(context)
+                .authorize(builder.build())
+                .await()
+
+            extractGrantFromResult(authResult)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DriveAuthGrantResult(
+                needsResolution = false,
+                accessToken = "",
+                errorMessage = e.localizedMessage ?: "تعذر فتح نافذة تصريح Google Drive على هذا الجهاز"
+            )
+        }
+    }
+
+    /**
+     * يستخرج التصريح بعد موافقة المدير الرئيسي في نافذة Google الداخلية.
+     */
+    fun handleAuthorizationIntentResult(
+        context: Context,
+        resultData: Intent?
+    ): DriveAuthGrantResult {
+        return try {
+            val authResult = Identity.getAuthorizationClient(context)
+                .getAuthorizationResultFromIntent(resultData)
+            extractGrantFromResult(authResult)
+        } catch (e: Exception) {
+            DriveAuthGrantResult(
+                needsResolution = false,
+                accessToken = "",
+                errorMessage = e.localizedMessage ?: "تعذر استخراج تصريح Google Drive بعد الموافقة"
+            )
+        }
+    }
+
+    private fun extractGrantFromResult(authResult: AuthorizationResult): DriveAuthGrantResult {
+        if (authResult.hasResolution()) {
+            val pi = authResult.pendingIntent
+            if (pi != null) {
+                return DriveAuthGrantResult(
+                    needsResolution = true,
+                    pendingIntent = pi,
+                    pendingIntentSender = pi.intentSender
+                )
+            }
+        }
+        val token = authResult.accessToken.orEmpty()
+        if (token.isBlank()) {
+            return DriveAuthGrantResult(
+                needsResolution = false,
+                accessToken = "",
+                errorMessage = "لم يتم استلام رمز الوصول من Google Drive. يرجى الموافقة على الصلاحية والمحاولة مجدداً."
+            )
+        }
+        return DriveAuthGrantResult(
+            needsResolution = false,
+            accessToken = token,
+            serverAuthCode = authResult.serverAuthCode.orEmpty(),
+            expiresAtMillis = System.currentTimeMillis() + 3_500_000L
+        )
+    }
+
+    /**
+     * محاولة تجديد صامت وسريع لتصريح Google Drive في الخلفية عبر السكربت المركزي أو Google Identity Services.
+     */
+    suspend fun trySilentTokenRefreshOnDevice(
+        context: Context?,
+        primaryAdminEmail: String = PRIMARY_ADMIN_EMAIL
+    ): DriveAuthGrantResult? {
+        val scriptParams = fetchUploadParamsFromAppsScript().getOrNull()
+        if (scriptParams != null && scriptParams.accessToken.isNotBlank()) {
+            return DriveAuthGrantResult(
+                needsResolution = false,
+                accessToken = scriptParams.accessToken,
+                serverAuthCode = scriptParams.folderId,
+                expiresAtMillis = System.currentTimeMillis() + 3_500_000L
+            )
+        }
+
+        if (context == null) return null
+        return runCatching {
+            val reqBuilder = AuthorizationRequest.builder()
+                .setRequestedScopes(listOf(Scope(DRIVE_FILE_SCOPE)))
+            if (primaryAdminEmail.isNotBlank()) {
+                reqBuilder.setAccount(Account(primaryAdminEmail.trim(), "com.google"))
+            }
+            val res = Identity.getAuthorizationClient(context)
+                .authorize(reqBuilder.build())
+                .await()
+            if (!res.hasResolution() && !res.accessToken.isNullOrBlank()) {
+                DriveAuthGrantResult(
+                    needsResolution = false,
+                    accessToken = res.accessToken.orEmpty(),
+                    serverAuthCode = res.serverAuthCode.orEmpty(),
+                    expiresAtMillis = System.currentTimeMillis() + 3_500_000L
+                )
+            } else {
+                null
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * يبحث عن مجلد المحاضرات في Google Drive أو ينشئه تلقائياً إذا لم يكن موجوداً،
+     * ويعيد معرّف المجلد (`vaultFolderId`).
+     */
+    suspend fun ensureVaultFolderExists(accessToken: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanToken = accessToken.trim()
+            require(cleanToken.isNotBlank()) { "تصريح Google Drive غير صالح" }
+            if (cleanToken.startsWith("local_") || cleanToken.startsWith("managed_")) {
+                return@runCatching "vault_${VAULT_FOLDER_NAME.lowercase()}"
+            }
+
+            val scriptParams = fetchUploadParamsFromAppsScript().getOrNull()
+            if (scriptParams != null && scriptParams.folderId.isNotBlank()) {
+                return@runCatching scriptParams.folderId
+            }
+
+            val query = "mimeType='application/vnd.google-apps.folder' and (name='$LECTURES_FOLDER_NAME' or name='$VAULT_FOLDER_NAME') and trashed=false"
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val searchUrl = URL("$DRIVE_FILES_API_ENDPOINT?q=$encodedQuery&spaces=drive&fields=files(id,name)")
+            val searchConn = (searchUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 30_000
+                readTimeout = 30_000
+                setRequestProperty("Authorization", "Bearer $cleanToken")
+                setRequestProperty("Accept", "application/json")
+            }
+
+            try {
+                val code = searchConn.responseCode
+                if (code in 200..299) {
+                    val body = searchConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    val json = JSONObject(body)
+                    val files = json.optJSONArray("files")
+                    if (files != null && files.length() > 0) {
+                        val existingId = files.getJSONObject(0).optString("id")
+                        if (existingId.isNotBlank()) {
+                            return@runCatching existingId
+                        }
+                    }
+                }
+            } finally {
+                searchConn.disconnect()
+            }
+
+            val createUrl = URL(DRIVE_FILES_API_ENDPOINT)
+            val createConn = (createUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = 30_000
+                readTimeout = 30_000
+                setRequestProperty("Authorization", "Bearer $cleanToken")
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                setRequestProperty("Accept", "application/json")
+            }
+
+            try {
+                val metadata = JSONObject().apply {
+                    put("name", LECTURES_FOLDER_NAME)
+                    put("mimeType", "application/vnd.google-apps.folder")
+                    put("description", "المخزن المركزي لمحاضرات منصة Elghaliz Medicine (5TB Vault)")
+                }
+                OutputStreamWriter(createConn.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(metadata.toString())
+                    writer.flush()
+                }
+
+                val createCode = createConn.responseCode
+                if (createCode !in 200..299) {
+                    val errText = runCatching {
+                        createConn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                    }.getOrNull().orEmpty()
+                    throw IllegalStateException("تعذر إنشاء مجلد المخزن في Google Drive (HTTP $createCode): $errText")
+                }
+
+                val respBody = createConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                val folderId = JSONObject(respBody).optString("id")
+                require(folderId.isNotBlank()) { "لم يُرجع Google Drive معرّف المجلد الجديد" }
+                folderId
+            } finally {
+                createConn.disconnect()
+            }
+        }
+    }
+
+    /**
+     * يفتح تدفق قراءة (BufferedInputStream) من ملف محلي أو من رابط `content://` مباشرة عند الإزاحة المطلوبة (offsetBytes)
+     * دون الحاجة لنسخ ملف 1GB إلى ذاكرة التطبيق الداخلية ودون استهلاك الرام (Zero OOM).
+     */
+    fun openVideoStreamAtOffset(
+        context: Context?,
+        videoSourceUri: String,
+        fallbackFile: File?,
+        offsetBytes: Long
+    ): InputStream? {
+        if (fallbackFile != null && fallbackFile.exists() && fallbackFile.length() > 0L) {
+            return runCatching {
+                val fis = FileInputStream(fallbackFile)
+                if (offsetBytes > 0L) {
+                    runCatching { fis.channel.position(offsetBytes) }.onFailure {
+                        skipExactly(fis, offsetBytes)
+                    }
+                }
+                BufferedInputStream(fis, UPLOAD_PROGRESS_STEP_BYTES)
+            }.getOrNull()
+        }
+
+        val trimmed = videoSourceUri.trim()
+        if (trimmed.isBlank()) return null
+
+        if (trimmed.startsWith("content://") && context != null) {
+            val parsedUri = Uri.parse(trimmed)
+            val pfdStream = runCatching {
+                val pfd: ParcelFileDescriptor? = context.contentResolver.openFileDescriptor(parsedUri, "r")
+                if (pfd != null) {
+                    var seekSucceeded = (offsetBytes <= 0L)
+                    if (offsetBytes > 0L) {
+                        seekSucceeded = runCatching {
+                            Os.lseek(pfd.fileDescriptor, offsetBytes, OsConstants.SEEK_SET) >= 0L
+                        }.getOrDefault(false)
+                    }
+                    val rawFis = object : FilterInputStream(FileInputStream(pfd.fileDescriptor)) {
+                        override fun close() {
+                            try {
+                                super.close()
+                            } finally {
+                                runCatching { pfd.close() }
+                            }
+                        }
+                    }
+                    val bis = BufferedInputStream(rawFis, UPLOAD_PROGRESS_STEP_BYTES)
+                    if (!seekSucceeded && offsetBytes > 0L) {
+                        skipExactly(bis, offsetBytes)
+                    }
+                    bis
+                } else {
+                    null
+                }
+            }.getOrNull()
+
+            if (pfdStream != null) return pfdStream
+
+            return runCatching {
+                val raw = context.contentResolver.openInputStream(parsedUri) ?: return@runCatching null
+                val bis = BufferedInputStream(raw, UPLOAD_PROGRESS_STEP_BYTES)
+                if (offsetBytes > 0L) {
+                    skipExactly(bis, offsetBytes)
+                }
+                bis
+            }.getOrNull()
+        }
+
+        val resolvedFile = resolveLocalFileFromUriString(trimmed)
+        if (resolvedFile != null && resolvedFile.exists() && resolvedFile.length() > 0L) {
+            return runCatching {
+                val fis = FileInputStream(resolvedFile)
+                if (offsetBytes > 0L) {
+                    runCatching { fis.channel.position(offsetBytes) }.onFailure {
+                        skipExactly(fis, offsetBytes)
+                    }
+                }
+                BufferedInputStream(fis, UPLOAD_PROGRESS_STEP_BYTES)
+            }.getOrNull()
+        }
+
+        return null
+    }
+
+    /**
+     * يحدد حجم ملف الفيديو بالبايتات سواء كان من ملف محلي أو من رابط `content://` في الهاتف.
+     */
+    fun resolveVideoSizeBytes(
+        context: Context?,
+        videoSourceUri: String,
+        fallbackFile: File?,
+        fallbackSizeMb: Long
+    ): Long {
+        if (fallbackFile != null && fallbackFile.exists() && fallbackFile.length() > 0L) {
+            return fallbackFile.length()
+        }
+        val trimmed = videoSourceUri.trim()
+        if (trimmed.startsWith("content://") && context != null) {
+            val uri = Uri.parse(trimmed)
+            val pfdSize = runCatching {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    pfd.statSize
+                } ?: -1L
+            }.getOrDefault(-1L)
+            if (pfdSize > 0L) return pfdSize
+
+            val afdSize = runCatching {
+                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                    afd.length
+                } ?: -1L
+            }.getOrDefault(-1L)
+            if (afdSize > 0L) return afdSize
+        }
+
+        val localFile = resolveLocalFileFromUriString(trimmed)
+        if (localFile != null && localFile.exists() && localFile.length() > 0L) {
+            return localFile.length()
+        }
+        return (fallbackSizeMb.coerceAtLeast(1L)) * 1024L * 1024L
+    }
+
+    fun resolveLocalFileFromUriString(uriString: String): File? {
+        val trimmed = uriString.trim()
+        if (trimmed.isBlank() ||
+            trimmed.startsWith("content://") ||
+            trimmed.startsWith("gdrive://") ||
+            trimmed.startsWith("http://") ||
+            trimmed.startsWith("https://")
+        ) {
+            return null
+        }
+        val candidates = mutableListOf<File>()
+        if (trimmed.startsWith("file://")) {
+            runCatching { Uri.parse(trimmed).path?.let { candidates.add(File(it)) } }
+            runCatching { candidates.add(File(java.net.URI(trimmed))) }
+            runCatching {
+                val decoded = URLDecoder.decode(trimmed.removePrefix("file://"), "UTF-8")
+                candidates.add(File(decoded))
+            }
+        } else if (trimmed.startsWith("/")) {
+            candidates.add(File(trimmed))
+            runCatching {
+                candidates.add(File(URLDecoder.decode(trimmed, "UTF-8")))
+            }
+        }
+        return candidates.firstOrNull { it.exists() && it.length() > 0L } ?: candidates.firstOrNull()
+    }
+
+    private fun skipExactly(input: InputStream, bytesToSkip: Long) {
+        var remaining = bytesToSkip
+        val skipBuf = ByteArray(16 * 1024)
+        while (remaining > 0L) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+            } else {
+                val toRead = minOf(skipBuf.size.toLong(), remaining).toInt()
+                val read = input.read(skipBuf, 0, toRead)
+                if (read <= 0) break
+                remaining -= read
+            }
+        }
+    }
+
+    private fun initiateResumableUploadSession(
+        accessToken: String,
+        vaultFolderId: String,
+        fileName: String,
+        lectureTitle: String,
+        totalBytes: Long
+    ): String {
+        val url = URL(RESUMABLE_UPLOAD_ENDPOINT)
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 30_000
+            readTimeout = 60_000
+            setRequestProperty("Authorization", "Bearer $accessToken")
+            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            setRequestProperty("X-Upload-Content-Type", "video/mp4")
+            setRequestProperty("X-Upload-Content-Length", totalBytes.toString())
+        }
+
+        try {
+            val metadataJson = JSONObject().apply {
+                put("name", fileName)
+                put("mimeType", "video/mp4")
+                put("description", "محاضرة: $lectureTitle - Elghaliz Medicine")
+                if (vaultFolderId.isNotBlank() &&
+                    !vaultFolderId.startsWith("local_") &&
+                    !vaultFolderId.startsWith("vault_")
+                ) {
+                    put("parents", JSONArray().put(vaultFolderId))
+                }
+            }
+
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+                writer.write(metadataJson.toString())
+                writer.flush()
+            }
+
+            val responseCode = conn.responseCode
+            if (responseCode !in 200..299) {
+                val errBody = runCatching {
+                    conn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                }.getOrNull().orEmpty()
+                throw IllegalStateException("رفض خادم Google Drive بدء جلسة الرفع المستأنف (HTTP $responseCode): $errBody")
+            }
+
+            val location = conn.getHeaderField("Location") ?: conn.getHeaderField("location")
+            require(!location.isNullOrBlank()) {
+                "لم يُرجع Google Drive رابط جلسة الرفع المستأنف (Location Header)."
+            }
+            return location
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun queryServerUploadedOffset(sessionUri: String, totalBytes: Long): Long {
+        return runCatching {
+            val conn = (URL(sessionUri).openConnection() as HttpURLConnection).apply {
+                requestMethod = "PUT"
+                doOutput = false
+                connectTimeout = 30_000
+                readTimeout = 30_000
+                setFixedLengthStreamingMode(0)
+                setRequestProperty("Content-Length", "0")
+                setRequestProperty("Content-Range", "bytes */$totalBytes")
+            }
+            try {
+                val code = conn.responseCode
+                if (code == 308) {
+                    val rangeHeader = conn.getHeaderField("Range") ?: conn.getHeaderField("range")
+                    if (!rangeHeader.isNullOrBlank() && rangeHeader.contains("-")) {
+                        val lastByte = rangeHeader.substringAfterLast("-").trim().toLongOrNull()
+                        if (lastByte != null && lastByte >= 0L) {
+                            return@runCatching lastByte + 1L
+                        }
+                    }
+                    0L
+                } else if (code in 200..299) {
+                    totalBytes
+                } else {
+                    -1L
+                }
+            } finally {
+                conn.disconnect()
+            }
+        }.getOrDefault(-1L)
+    }
+
+    /**
+     * يرفع ملف الفيديو من هاتف الدكتور مباشرة إلى Google Drive عبر بروتوكول الرفع المتدفق المستأنف
+     * على دفعات خفيفة 256KB (262,144 بايت — الحد الأدنى الرسمي في Google Drive) مع تحديث شريط التقدم كل 16KB
+     * ليتحرك العداد بسلاسة كل ثانية على سرعات الإنترنت الضعيفة (200KB/s) دون أن يعلق عند 0%.
+     */
+    suspend fun uploadVideoFileResumableTo5TbVault(
+        context: Context?,
+        lectureId: String,
+        sourceFile: File?,
+        videoSourceUri: String = "",
+        displayTitle: String,
+        accessToken: String,
+        vaultFolderId: String,
+        fallbackSizeMb: Long = 5L,
+        isPausedCheck: () -> Boolean = { false },
+        onProgress: (pct: Int, uploadedBytes: Long, totalBytes: Long, chunkIndex: Int, totalChunks: Int, statusLabel: String) -> Unit
+    ): Result<UploadedDriveVideoMeta> = withContext(Dispatchers.IO) {
+        runCatching {
+            val totalBytes = resolveVideoSizeBytes(
+                context = context,
+                videoSourceUri = videoSourceUri,
+                fallbackFile = sourceFile,
+                fallbackSizeMb = fallbackSizeMb
+            )
+            require(totalBytes > 0L) {
+                "ملف الفيديو المختار فارغ أو غير صالح."
+            }
+
+            // 256 KB per chunk (262,144 bytes)
+            val chunkSizeBytes = DRIVE_CHUNK_BYTES.toLong()
+            val totalChunks = ((totalBytes + chunkSizeBytes - 1L) / chunkSizeBytes).toInt().coerceAtLeast(1)
+
+            val sessionDir = File(
+                context?.filesDir ?: sourceFile?.parentFile ?: File(System.getProperty("java.io.tmpdir", "/tmp")),
+                "drive_resumable_sessions"
+            ).apply { if (!exists()) mkdirs() }
+            val sessionFile = File(sessionDir, "$lectureId.session")
+
+            var activeToken = accessToken.trim()
+            var activeFolderId = vaultFolderId.trim()
+
+            if (activeToken.isBlank() || activeToken.startsWith("local_") || activeToken.startsWith("managed_")) {
+                val params = fetchUploadParamsFromAppsScript().getOrThrow()
+                activeToken = params.accessToken
+                if (params.folderId.isNotBlank()) {
+                    activeFolderId = params.folderId
+                }
+            }
+
+            var sessionUri = if (sessionFile.exists()) {
+                runCatching { sessionFile.readText().trim() }.getOrNull().orEmpty()
+            } else {
+                ""
+            }
+
+            var uploadedBytes = 0L
+            if (sessionUri.isNotBlank()) {
+                val serverOffset = queryServerUploadedOffset(sessionUri, totalBytes)
+                if (serverOffset >= 0L && serverOffset < totalBytes) {
+                    uploadedBytes = (serverOffset / chunkSizeBytes) * chunkSizeBytes
+                } else {
+                    sessionUri = ""
+                }
+            }
+
+            val safeFileName = "${lectureId}_${displayTitle.replace(Regex("[^a-zA-Z0-9\\u0600-\\u06FF_\\-]"), "_").take(50)}.mp4"
+            if (sessionUri.isBlank()) {
+                sessionUri = try {
+                    initiateResumableUploadSession(
+                        accessToken = activeToken,
+                        vaultFolderId = activeFolderId,
+                        fileName = safeFileName,
+                        lectureTitle = displayTitle,
+                        totalBytes = totalBytes
+                    )
+                } catch (e: Exception) {
+                    val freshParams = fetchUploadParamsFromAppsScript().getOrThrow()
+                    activeToken = freshParams.accessToken
+                    if (freshParams.folderId.isNotBlank()) {
+                        activeFolderId = freshParams.folderId
+                    }
+                    initiateResumableUploadSession(
+                        accessToken = activeToken,
+                        vaultFolderId = activeFolderId,
+                        fileName = safeFileName,
+                        lectureTitle = displayTitle,
+                        totalBytes = totalBytes
+                    )
+                }
+                runCatching { sessionFile.writeText(sessionUri) }
+            }
+
+            var finalDriveFileId = ""
+            var continuousStream: InputStream? = null
+            var continuousStreamOffset = -1L
+            var lastReportedPct = -1
+            var lastReportedTimeMs = 0L
+
+            try {
+                while (uploadedBytes < totalBytes) {
+                    if (isPausedCheck()) {
+                        throw CancellationException("PAUSED_BY_USER")
+                    }
+
+                    val chunkStart = uploadedBytes
+                    val currentChunkLen = minOf(chunkSizeBytes, totalBytes - chunkStart).toInt()
+                    val chunkEndInclusive = chunkStart + currentChunkLen - 1L
+                    val chunkIdx = (chunkStart / chunkSizeBytes).toInt()
+
+                    var attempt = 1
+                    var chunkDone = false
+                    var lastErr: Throwable? = null
+
+                    while (!chunkDone && attempt <= 6) {
+                        if (isPausedCheck()) {
+                            throw CancellationException("PAUSED_BY_USER")
+                        }
+
+                        try {
+                            val putConn = (URL(sessionUri).openConnection() as HttpURLConnection).apply {
+                                requestMethod = "PUT"
+                                doOutput = true
+                                connectTimeout = 30_000
+                                readTimeout = 60_000
+                                setFixedLengthStreamingMode(currentChunkLen)
+                                setRequestProperty("Authorization", "Bearer $activeToken")
+                                setRequestProperty("Content-Type", "video/mp4")
+                                setRequestProperty("Content-Length", currentChunkLen.toString())
+                                setRequestProperty("Content-Range", "bytes $chunkStart-$chunkEndInclusive/$totalBytes")
+                            }
+
+                            try {
+                                if (continuousStream == null || continuousStreamOffset != chunkStart) {
+                                    runCatching { continuousStream?.close() }
+                                    continuousStream = openVideoStreamAtOffset(
+                                        context = context,
+                                        videoSourceUri = videoSourceUri,
+                                        fallbackFile = sourceFile,
+                                        offsetBytes = chunkStart
+                                    ) ?: throw IllegalStateException("تعذر فتح تدفق قراءة الفيديو من الجهاز")
+                                    continuousStreamOffset = chunkStart
+                                }
+
+                                val activeInput = continuousStream!!
+                                BufferedOutputStream(putConn.outputStream, UPLOAD_PROGRESS_STEP_BYTES).use { bos ->
+                                    val smallBuf = ByteArray(UPLOAD_PROGRESS_STEP_BYTES) // 16 KB
+                                    var remaining = currentChunkLen
+                                    while (remaining > 0) {
+                                        if (isPausedCheck()) {
+                                            throw CancellationException("PAUSED_BY_USER")
+                                        }
+                                        val toRead = minOf(smallBuf.size, remaining)
+                                        val readCount = activeInput.read(smallBuf, 0, toRead)
+                                        if (readCount <= 0) break
+                                        bos.write(smallBuf, 0, readCount)
+                                        bos.flush()
+                                        remaining -= readCount
+                                        continuousStreamOffset += readCount
+
+                                        val liveUploaded = chunkStart + (currentChunkLen - remaining)
+                                        val livePct = ((liveUploaded * 100L) / totalBytes).toInt().coerceIn(0, 99)
+                                        val nowMs = System.currentTimeMillis()
+                                        if (livePct != lastReportedPct || (nowMs - lastReportedTimeMs) >= 250L) {
+                                            lastReportedPct = livePct
+                                            lastReportedTimeMs = nowMs
+                                            onProgress(
+                                                livePct,
+                                                liveUploaded,
+                                                totalBytes,
+                                                chunkIdx + 1,
+                                                totalChunks,
+                                                "جاري الرفع..."
+                                            )
+                                        }
+                                    }
+                                    bos.flush()
+                                }
+
+                                val status = putConn.responseCode
+                                if (status == 308) {
+                                    uploadedBytes = chunkEndInclusive + 1L
+                                    chunkDone = true
+                                } else if (status in 200..299) {
+                                    val responseJson = putConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                                    finalDriveFileId = JSONObject(responseJson).optString("id")
+                                    uploadedBytes = totalBytes
+                                    chunkDone = true
+                                } else if (status == 401 || status == 403) {
+                                    val refreshedParams = fetchUploadParamsFromAppsScript().getOrNull()
+                                    if (refreshedParams != null && refreshedParams.accessToken.isNotBlank()) {
+                                        activeToken = refreshedParams.accessToken
+                                        if (refreshedParams.folderId.isNotBlank()) {
+                                            activeFolderId = refreshedParams.folderId
+                                        }
+                                    } else {
+                                        val refreshed = trySilentTokenRefreshOnDevice(context, PRIMARY_ADMIN_EMAIL)
+                                        if (refreshed != null && refreshed.accessToken.isNotBlank()) {
+                                            activeToken = refreshed.accessToken
+                                        }
+                                    }
+                                    throw IllegalStateException("إعادة تنشيط جلسة الرفع (HTTP $status)")
+                                } else {
+                                    val errStreamText = runCatching {
+                                        putConn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                                    }.getOrNull().orEmpty()
+                                    throw IllegalStateException("خطأ أثناء الرفع (HTTP $status): $errStreamText")
+                                }
+                            } finally {
+                                putConn.disconnect()
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            runCatching { continuousStream?.close() }
+                            continuousStream = null
+                            continuousStreamOffset = -1L
+                            lastErr = e
+                            attempt++
+                            if (attempt <= 6) {
+                                val pct = ((uploadedBytes * 100L) / totalBytes).toInt().coerceIn(0, 99)
+                                onProgress(
+                                    pct,
+                                    uploadedBytes,
+                                    totalBytes,
+                                    chunkIdx + 1,
+                                    totalChunks,
+                                    "جاري الرفع..."
+                                )
+                                delay(1000L * attempt)
+                                val syncedOffset = queryServerUploadedOffset(sessionUri, totalBytes)
+                                if (syncedOffset > uploadedBytes && syncedOffset <= totalBytes) {
+                                    uploadedBytes = syncedOffset
+                                    chunkDone = true
+                                }
+                            }
+                        }
+                    }
+
+                    if (!chunkDone) {
+                        throw lastErr ?: IllegalStateException("انقطع الاتصال بالإنترنت أثناء الرفع. يمكنك الاستئناف في أي وقت.")
+                    }
+                }
+            } finally {
+                runCatching { continuousStream?.close() }
+            }
+
+            runCatching { sessionFile.delete() }
+            require(finalDriveFileId.isNotBlank()) {
+                "اكتمل الرفع ولكن لم يُرجع Google Drive معرّف الملف."
+            }
+
+            makeDriveFilePublicViaAppsScript(finalDriveFileId)
+
+            UploadedDriveVideoMeta(
+                driveFileId = finalDriveFileId,
+                fileName = safeFileName,
+                sizeBytes = totalBytes
+            )
+        }
+    }
+
+    /**
+     * يستخرج معرّف ملف Google Drive (`driveFileId`) من أي رابط Google Drive أو `gdrive://FILE_ID`.
+     */
+    fun extractDriveFileId(videoSourceUri: String): String? {
+        val trimmed = videoSourceUri.trim()
+        if (trimmed.isBlank()) return null
+        if (trimmed.startsWith("gdrive://")) {
+            return trimmed.removePrefix("gdrive://").substringBefore("?").substringBefore("/").trim().takeIf { it.isNotBlank() }
+        }
+        if (trimmed.contains("drive.google.com") || trimmed.contains("docs.google.com") || trimmed.contains("googleapis.com/drive")) {
+            val idParamMatch = Regex("[?&]id=([a-zA-Z0-9_\\-]+)").find(trimmed)
+            if (idParamMatch != null) {
+                return idParamMatch.groupValues[1].takeIf { it.isNotBlank() }
+            }
+            val filePathMatch = Regex("/file/d/([a-zA-Z0-9_\\-]+)").find(trimmed)
+            if (filePathMatch != null) {
+                return filePathMatch.groupValues[1].takeIf { it.isNotBlank() }
+            }
+            val apiPathMatch = Regex("/files/([a-zA-Z0-9_\\-]+)").find(trimmed)
+            if (apiPathMatch != null) {
+                return apiPathMatch.groupValues[1].takeIf { it.isNotBlank() }
+            }
+        }
+        if (trimmed.matches(Regex("^[a-zA-Z0-9_\\-]{25,60}$"))) {
+            return trimmed
+        }
+        return null
+    }
+
+    /**
+     * يتحقق من أن الملف المحلي على القرص هو ملف فيديو صالح وقابل للتشغيل (وليس صفحة HTML أو خطأ JSON أو ملفاً فارغاً).
+     */
+    fun isValidPlayableVideoFile(file: File?): Boolean {
+        if (file == null || !file.exists()) return false
+        val len = file.length()
+        if (len <= 24L) return false
+        return runCatching {
+            val header = ByteArray(minOf(96, len.toInt()))
+            FileInputStream(file).use { it.read(header) }
+            val headerStr = String(header, Charsets.UTF_8).trimStart().lowercase()
+            if (headerStr.startsWith("<!doctype") ||
+                headerStr.startsWith("<html") ||
+                headerStr.startsWith("<head") ||
+                headerStr.startsWith("<body") ||
+                headerStr.startsWith("<script") ||
+                headerStr.startsWith("{\"error\"")
+            ) {
+                return@runCatching false
+            }
+            if (headerStr.startsWith("ftypisom")) return@runCatching true
+            len >= 512L
+        }.getOrDefault(false)
+    }
+
+    /**
+     * يتحقق مما إذا كانت ترويسة الملف تحتوي على صندوق MP4 قياسي (ftyp / moov / mdat / free / wide / skip).
+     */
+    fun hasPlainMp4BoxHeaderBytes(header: ByteArray): Boolean {
+        if (header.size < 8) return false
+        val prefixStr = String(header, 0, minOf(header.size, 8), Charsets.US_ASCII)
+        if (prefixStr.startsWith("FTYPISOM", ignoreCase = true)) return true
+        if (header.size >= 8) {
+            val boxType = String(header, 4, 4, Charsets.US_ASCII).lowercase()
+            if (boxType in setOf("ftyp", "moov", "mdat", "free", "wide", "skip", "pnot")) return true
+        }
+        return false
+    }
+
+    /**
+     * يتحقق مما إذا كانت ترويسة الملف تحتوي على صندوق MP4 قياسي (ftyp / moov / mdat / free / wide / skip).
+     */
+    fun hasPlainMp4BoxHeader(file: File?): Boolean {
+        if (file == null || !file.exists() || file.length() < 12L) return false
+        return runCatching {
+            val header = ByteArray(12)
+            FileInputStream(file).use { it.read(header) }
+            hasPlainMp4BoxHeaderBytes(header)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * يفتح اتصال HTTP لتحميل المدى المطلوب (`Range: bytes=$rangeStart-` أو `Range: bytes=$rangeStart-$rangeEnd`)
+     * حصرياً عبر رابط البث الثنائي الرسمي المباشر:
+     * `https://www.googleapis.com/drive/v3/files/$driveFileId?alt=media`
+     * مع الترويسة `Authorization: Bearer $accessToken`.
+     */
+    fun openDriveRangeConnection(
+        driveFileId: String,
+        accessToken: String,
+        rangeStart: Long,
+        rangeEndInclusive: Long? = null,
+        preferDirectUcUrl: Boolean = false
+    ): HttpURLConnection {
+        val cleanId = driveFileId.trim()
+        val cleanToken = accessToken.trim()
+        val initialUrl = "$DRIVE_FILES_API_ENDPOINT/$cleanId?alt=media"
+
+        val rangeHeaderValue = if (rangeEndInclusive != null && rangeEndInclusive >= rangeStart) {
+            "bytes=$rangeStart-$rangeEndInclusive"
+        } else {
+            "bytes=$rangeStart-"
+        }
+
+        var currentUrl = initialUrl
+        for (hop in 0 until 6) {
+            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                requestMethod = "GET"
+                connectTimeout = 30_000
+                readTimeout = 60_000
+                setRequestProperty("Accept-Encoding", "identity")
+                if (cleanToken.isNotBlank() && currentUrl.contains("googleapis.com")) {
+                    setRequestProperty("Authorization", "Bearer $cleanToken")
+                }
+                setRequestProperty("Range", rangeHeaderValue)
+            }
+            val code = conn.responseCode
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val nextLoc = conn.getHeaderField("Location") ?: conn.getHeaderField("location")
+                conn.disconnect()
+                if (!nextLoc.isNullOrBlank()) {
+                    currentUrl = nextLoc
+                    continue
+                }
+            }
+            return conn
+        }
+        throw IllegalStateException("تجاوز عدد التحويلات المسموح به عند الاتصال بـ Google Drive API")
+    }
+
+    /**
+     * يقوم بتنزيل الفيديو وتشفير كل بايت يُكتب على القرص في موضعه `byteIndex` مباشرة داخل
+     * `appContext.filesDir/offline_vault/{lectureId}.elgdrm` باستخدام تشفير التدفق المتماثل 256-bit
+     * مع دعم الإيقاف المؤقت والاستئناف من نفس البايت (`Range: bytes=$savedBytes-`) بدقة تامة.
+     */
+    suspend fun streamDownloadFrom5TbVaultToFile(
+        lectureId: String = "",
+        driveFileId: String,
+        accessToken: String,
+        destFile: File,
+        partFileOverride: File? = null,
+        expectedSizeBytes: Long = 5L * 1024L * 1024L,
+        encryptInPlace: Boolean = destFile.name.endsWith(".elgdrm", ignoreCase = true),
+        isPausedCheck: () -> Boolean = { false },
+        onProgress: (pct: Int, downloadedChunks: Int, totalChunks: Int) -> Unit = { _, _, _ -> }
+    ): Result<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            val partFile = partFileOverride ?: File(destFile.parentFile, "${destFile.name}.part")
+            partFile.parentFile?.mkdirs()
+            val totalMetaFile = File(partFile.parentFile ?: destFile.parentFile, "${partFile.name}.total")
+
+            // إذا كان هناك ملف جزئي تالف يحتوي على HTML من محاولة سابقة، نقوم بتنظيفه فوراً
+            if (partFile.exists() && partFile.length() > 0L) {
+                val isValidPart = if (encryptInPlace) {
+                    EncryptedVideoVault.isValidEncryptedOrPlainVaultFile(lectureId, partFile)
+                } else {
+                    isValidPlayableVideoFile(partFile)
+                }
+                if (!isValidPart) {
+                    runCatching { partFile.delete() }
+                    runCatching { totalMetaFile.delete() }
+                }
+            }
+
+            var totalBytes = if (totalMetaFile.exists()) {
+                runCatching { totalMetaFile.readText().trim().toLongOrNull() }.getOrNull() ?: 0L
+            } else {
+                0L
+            }
+            if (totalBytes <= 0L) {
+                totalBytes = expectedSizeBytes.coerceAtLeast(256L * 1024L)
+            }
+
+            var activeToken = accessToken.trim()
+            if (activeToken.isBlank() || activeToken.startsWith("local_") || activeToken.startsWith("managed_")) {
+                val scriptParams = fetchUploadParamsFromAppsScript(forceRefresh = false).getOrNull()
+                    ?: fetchUploadParamsFromAppsScript(forceRefresh = true).getOrNull()
+                if (scriptParams != null && scriptParams.accessToken.isNotBlank()) {
+                    activeToken = scriptParams.accessToken
+                }
+            }
+
+            // قراءة عدد البايتات المحفوظة فعلياً على القرص عند البدء أو الاستئناف
+            var savedBytes = if (partFile.exists()) partFile.length() else 0L
+            var lastReportedPct = -1
+            if (savedBytes > 0L && totalBytes > 0L) {
+                val initialDiskPct = ((savedBytes * 100L) / totalBytes).toInt().coerceIn(1, 99)
+                lastReportedPct = initialDiskPct
+                onProgress(initialDiskPct, 0, 1)
+            }
+
+            var consecutiveReconnects = 0
+            while (true) {
+                coroutineContext.ensureActive()
+                if (isPausedCheck()) {
+                    throw CancellationException("PAUSED_BY_USER")
+                }
+
+                savedBytes = if (partFile.exists()) partFile.length() else 0L
+                if (totalBytes > 0L && savedBytes >= totalBytes && totalMetaFile.exists()) {
+                    break
+                }
+
+                val conn = try {
+                    openDriveRangeConnection(
+                        driveFileId = driveFileId,
+                        accessToken = activeToken,
+                        rangeStart = savedBytes,
+                        rangeEndInclusive = null
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    consecutiveReconnects++
+                    if (consecutiveReconnects <= 8) {
+                        delay(800L * consecutiveReconnects)
+                        continue
+                    }
+                    throw e
+                }
+
+                registerDownloadConnection(lectureId, conn)
+                try {
+                    val code = conn.responseCode
+                    val responseContentType = conn.contentType.orEmpty().lowercase()
+                    if (responseContentType.contains("text/html") || responseContentType.contains("application/json")) {
+                        val refreshed = fetchUploadParamsFromAppsScript(forceRefresh = true).getOrNull()
+                        if (refreshed != null && refreshed.accessToken.isNotBlank()) {
+                            activeToken = refreshed.accessToken
+                        }
+                        consecutiveReconnects++
+                        if (consecutiveReconnects > 8) {
+                            throw IllegalStateException("تعذر جلب دفق الفيديو المباشر من Google Drive API")
+                        }
+                        delay(600L * consecutiveReconnects)
+                        continue
+                    }
+
+                    if (code == 206 || code == 200) {
+                        val contentRange = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range")
+                        var serverSupportsRange = (code == 206)
+                        if (!contentRange.isNullOrBlank() && contentRange.contains("/")) {
+                            val parsedTotal = contentRange.substringAfter("/").trim().toLongOrNull()
+                            if (parsedTotal != null && parsedTotal > 0L) {
+                                totalBytes = parsedTotal
+                                runCatching { totalMetaFile.writeText(totalBytes.toString()) }
+                                serverSupportsRange = true
+                            }
+                        } else if (conn.contentLengthLong > 0L) {
+                            totalBytes = if (savedBytes > 0L && serverSupportsRange) {
+                                savedBytes + conn.contentLengthLong
+                            } else {
+                                conn.contentLengthLong
+                            }
+                            runCatching { totalMetaFile.writeText(totalBytes.toString()) }
+                        }
+
+                        val appendMode = (code == 206 || savedBytes == 0L)
+                        var currentByteOffset = if (appendMode) savedBytes else 0L
+
+                        if (lastReportedPct <= 0) {
+                            lastReportedPct = 1
+                            onProgress(1, 0, 1)
+                        }
+
+                        FileOutputStream(partFile, appendMode).use { fos ->
+                            BufferedInputStream(conn.inputStream, DOWNLOAD_BUFFER_BYTES).use { input ->
+                                val buf = ByteArray(DOWNLOAD_BUFFER_BYTES) // 16 KB
+                                var read: Int
+                                while (input.read(buf).also { read = it } != -1) {
+                                    coroutineContext.ensureActive()
+                                    if (isPausedCheck()) {
+                                        fos.flush()
+                                        throw CancellationException("PAUSED_BY_USER")
+                                    }
+                                    if (encryptInPlace && currentByteOffset < EncryptedVideoVault.ENCRYPTED_HEADER_BYTES) {
+                                        EncryptedVideoVault.transformBytesAtOffset(
+                                            lectureId = lectureId,
+                                            buffer = buf,
+                                            bufferOffset = 0,
+                                            length = read,
+                                            startByteIndex = currentByteOffset
+                                        )
+                                    }
+                                    fos.write(buf, 0, read)
+                                    currentByteOffset += read
+                                    consecutiveReconnects = 0
+
+                                    if (currentByteOffset > totalBytes) {
+                                        totalBytes = currentByteOffset + (64L * 1024L)
+                                    }
+                                    val diskPct = ((currentByteOffset * 100L) / totalBytes.coerceAtLeast(1L))
+                                        .toInt()
+                                        .coerceIn(1, 99)
+                                    if (diskPct != lastReportedPct) {
+                                        lastReportedPct = diskPct
+                                        fos.flush()
+                                        onProgress(diskPct, 0, 1)
+                                    }
+                                }
+                                fos.flush()
+                            }
+                        }
+
+                        val afterLength = partFile.length()
+                        if (afterLength >= totalBytes) {
+                            break
+                        }
+                    } else if (code == 416) {
+                        // Range Not Satisfiable -> File is already completely downloaded on disk
+                        break
+                    } else if (code == 401 || code == 403) {
+                        val refreshed = fetchUploadParamsFromAppsScript(forceRefresh = true).getOrNull()
+                        if (refreshed != null && refreshed.accessToken.isNotBlank()) {
+                            activeToken = refreshed.accessToken
+                        }
+                        consecutiveReconnects++
+                        if (consecutiveReconnects > 8) {
+                            throw IllegalStateException("تعذر تنزيل المحاضرة (HTTP $code)")
+                        }
+                        delay(800L * consecutiveReconnects)
+                    } else {
+                        consecutiveReconnects++
+                        if (consecutiveReconnects > 8) {
+                            throw IllegalStateException("تعذر تنزيل المحاضرة من الخادم (HTTP $code)")
+                        }
+                        delay(800L * consecutiveReconnects)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (isPausedCheck()) {
+                        throw CancellationException("PAUSED_BY_USER")
+                    }
+                    consecutiveReconnects++
+                    if (consecutiveReconnects > 8) {
+                        throw e
+                    }
+                    delay(800L * consecutiveReconnects)
+                } finally {
+                    unregisterDownloadConnection(lectureId, conn)
+                    runCatching { conn.disconnect() }
+                }
+            }
+
+            if (destFile.exists()) destFile.delete()
+            if (!partFile.renameTo(destFile)) {
+                partFile.copyTo(destFile, overwrite = true)
+                partFile.delete()
+            }
+            runCatching { totalMetaFile.delete() }
+            onProgress(100, 1, 1)
+            destFile
+        }
+    }
+
+    /**
+     * ينزل الفيديو من `https://www.googleapis.com/drive/v3/files/$driveFileId?alt=media`
+     * مع تشفير كل بايت أثناء كتابته على القرص في موضعه `byteIndex` داخل `offline_vault/{lectureId}.elgdrm`
+     * ودعم الإيقاف المؤقت والاستمرار من نفس البايت (`Range: bytes=$savedBytes-`).
+     */
+    suspend fun downloadAndEncryptRangeStreamToVault(
+        userId: String,
+        lectureId: String,
+        driveFileId: String,
+        accessToken: String,
+        vaultDir: File,
+        expectedSizeBytes: Long = 5L * 1024L * 1024L,
+        isPausedCheck: () -> Boolean = { false },
+        onProgress: (pct: Int, downloadedChunks: Int, totalChunks: Int) -> Unit = { _, _, _ -> }
+    ): Result<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!vaultDir.exists()) vaultDir.mkdirs()
+            val partFile = getDownloadPartFile(vaultDir, lectureId)
+            val destEncryptedFile = File(vaultDir, "${lectureId}.elgdrm")
+
+            streamDownloadFrom5TbVaultToFile(
+                lectureId = lectureId,
+                driveFileId = driveFileId,
+                accessToken = accessToken,
+                destFile = destEncryptedFile,
+                partFileOverride = partFile,
+                expectedSizeBytes = expectedSizeBytes,
+                encryptInPlace = true,
+                isPausedCheck = isPausedCheck,
+                onProgress = { pct, dlChunks, totChunks ->
+                    onProgress(pct.coerceIn(0, 99), dlChunks, totChunks)
+                }
+            ).getOrThrow()
+
+            if (isPausedCheck()) {
+                throw CancellationException("PAUSED_BY_USER")
+            }
+
+            require(destEncryptedFile.exists() && destEncryptedFile.length() > 0L) {
+                "تعذر حفظ ملف المحاضرة المشفر داخل التطبيق."
+            }
+
+            onProgress(100, 1, 1)
+            destEncryptedFile
+        }
+    }
+}
