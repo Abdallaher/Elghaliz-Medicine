@@ -1,4 +1,5 @@
-onlyBuiltDependencies:
-  - esbuild
-  - electron
-  - '@firebase/util'
+allowBuilds:
+  '@firebase/util': true
+  esbuild: true
+  protobufjs: true
+  electron-winstaller: true
