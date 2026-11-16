@@ -205,28 +205,26 @@ fun ElghalizAppRoot(
     onToggleDarkMode: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val isRobolectric = remember { Build.FINGERPRINT.equals("robolectric", ignoreCase = true) }
     val initialSavedSession = remember { SessionPreferences.getSavedSession(context) }
     var currentUser by remember { mutableStateOf(Firebase.auth.currentUser) }
+    var offlineSessionFallback by remember {
+        mutableStateOf(
+            if (!isRobolectric &&
+                initialSavedSession.autoSignInEnabled &&
+                (initialSavedSession.uid.isNotBlank() || initialSavedSession.email.isNotBlank())
+            ) {
+                initialSavedSession
+            } else {
+                null
+            }
+        )
+    }
     var selectedLoginRole by rememberSaveable { mutableStateOf(initialSavedSession.roleMode) }
     var sessionGeneration by remember { mutableIntStateOf(0) }
 
-    val isRobolectric = remember { Build.FINGERPRINT.equals("robolectric", ignoreCase = true) }
     var showEntrySplash by rememberSaveable { mutableStateOf(!isRobolectric) }
     var splashTriggerCount by rememberSaveable { mutableIntStateOf(0) }
-
-    LaunchedEffect(Unit) {
-        if (!isRobolectric) {
-            SessionPreferences.cleanDemoSessionExceptPrimaryAdmin(context)
-            val authUser = Firebase.auth.currentUser
-            if (authUser != null && authUser.email?.trim()?.lowercase() != "abdallahxh909@gmail.com") {
-                val saved = SessionPreferences.getSavedSession(context)
-                if (saved.email.isBlank()) {
-                    Firebase.auth.signOut()
-                    currentUser = null
-                }
-            }
-        }
-    }
 
     LaunchedEffect(splashTriggerCount) {
         if (!isRobolectric && showEntrySplash) {
@@ -251,8 +249,17 @@ fun ElghalizAppRoot(
                     email = user.email ?: "",
                     displayName = user.displayName ?: "",
                     roleMode = selectedLoginRole,
-                    autoSignInEnabled = true
+                    autoSignInEnabled = true,
+                    uid = user.uid
                 )
+                if (!isRobolectric) {
+                    offlineSessionFallback = SessionPreferences.getSavedSession(context)
+                }
+            } else {
+                val latestSaved = SessionPreferences.getSavedSession(context)
+                if (isRobolectric || !latestSaved.autoSignInEnabled) {
+                    offlineSessionFallback = null
+                }
             }
         }
         Firebase.auth.addAuthStateListener(listener)
@@ -263,7 +270,15 @@ fun ElghalizAppRoot(
 
     Box(modifier = Modifier.fillMaxSize()) {
         val user = currentUser
-        if (user == null) {
+        val savedOffline = offlineSessionFallback
+        val activeUid = user?.uid ?: savedOffline?.uid?.takeIf { it.isNotBlank() }
+            ?: savedOffline?.email?.takeIf { it.isNotBlank() }?.let {
+                "offline_${com.example.data.model.SecurityHashUtil.sha256Hex(it).take(20)}"
+            }
+        val activeEmail = user?.email?.takeIf { it.isNotBlank() } ?: savedOffline?.email.orEmpty()
+        val activeDisplayName = user?.displayName?.takeIf { it.isNotBlank() } ?: savedOffline?.displayName.orEmpty()
+
+        if (activeUid == null) {
             AuthScreen(
                 selectedRole = selectedLoginRole,
                 onRoleSelected = {
@@ -272,7 +287,21 @@ fun ElghalizAppRoot(
                 },
                 onAuthSuccess = {
                     sessionGeneration++
-                    currentUser = Firebase.auth.currentUser
+                    val loggedIn = Firebase.auth.currentUser
+                    currentUser = loggedIn
+                    if (loggedIn != null) {
+                        SessionPreferences.saveSession(
+                            context = context,
+                            email = loggedIn.email ?: "",
+                            displayName = loggedIn.displayName ?: "",
+                            roleMode = selectedLoginRole,
+                            autoSignInEnabled = true,
+                            uid = loggedIn.uid
+                        )
+                        if (!isRobolectric) {
+                            offlineSessionFallback = SessionPreferences.getSavedSession(context)
+                        }
+                    }
                     if (!isRobolectric) {
                         showEntrySplash = true
                         splashTriggerCount++
@@ -282,19 +311,20 @@ fun ElghalizAppRoot(
                 onToggleDarkMode = onToggleDarkMode
             )
         } else {
-            LaunchedEffect(user.uid, selectedLoginRole) {
+            LaunchedEffect(activeUid, activeEmail, selectedLoginRole) {
                 SessionPreferences.saveSession(
                     context = context,
-                    email = user.email ?: "",
-                    displayName = user.displayName ?: "",
+                    email = activeEmail,
+                    displayName = activeDisplayName,
                     roleMode = selectedLoginRole,
-                    autoSignInEnabled = true
+                    autoSignInEnabled = true,
+                    uid = activeUid
                 )
             }
 
-            key(user.uid, selectedLoginRole, sessionGeneration) {
+            key(activeUid, selectedLoginRole, sessionGeneration) {
                 val viewModel: ElghalizViewModel = viewModel(
-                    key = "${user.uid}_${selectedLoginRole.name}_$sessionGeneration",
+                    key = "${activeUid}_${selectedLoginRole.name}_$sessionGeneration",
                     factory = viewModelFactory {
                         initializer {
                             val app = checkNotNull(this[APPLICATION_KEY]) {
@@ -306,9 +336,9 @@ fun ElghalizAppRoot(
                             val repository = ElghalizRepository(db, vaultRoot, app.applicationContext)
                             ElghalizViewModel(
                                 repository = repository,
-                                currentUserId = user.uid,
-                                currentUserEmail = user.email ?: "",
-                                currentUserDisplayName = user.displayName ?: "",
+                                currentUserId = activeUid,
+                                currentUserEmail = activeEmail,
+                                currentUserDisplayName = activeDisplayName,
                                 initialRoleChoice = selectedLoginRole,
                                 appContext = app.applicationContext
                             )
@@ -321,6 +351,8 @@ fun ElghalizAppRoot(
                     isDarkMode = isDarkMode,
                     onToggleDarkMode = onToggleDarkMode,
                     onSignOutComplete = {
+                        SessionPreferences.markExplicitSignOut(context)
+                        offlineSessionFallback = null
                         currentUser = null
                     }
                 )

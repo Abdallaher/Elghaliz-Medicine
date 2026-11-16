@@ -98,6 +98,7 @@ fun AuthScreen(
 ) {
     val context = LocalContext.current
     var showIosWebAppGuideDialog by remember { mutableStateOf(false) }
+    var showWindowsGuideDialog by remember { mutableStateOf(false) }
     var copiedFeedback by remember { mutableStateOf(false) }
 
     val sheetBgColor = if (isDarkTheme) Color(0xFF0A2A20) else AuthCreamBg
@@ -372,27 +373,152 @@ fun AuthScreen(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    TextButton(
-                        onClick = { showIosWebAppGuideDialog = true },
-                        modifier = Modifier.testTag("ios_guide_button")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.PhoneIphone,
-                            contentDescription = null,
-                            tint = if (isDarkTheme) AuthGold else AuthMidGreen,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "دليل الدخول لمستخدمي iPhone / iOS",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (isDarkTheme) AuthGold else AuthMidGreen,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        TextButton(
+                            onClick = { showIosWebAppGuideDialog = true },
+                            modifier = Modifier.testTag("ios_guide_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PhoneIphone,
+                                contentDescription = null,
+                                tint = if (isDarkTheme) AuthGold else AuthMidGreen,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = "دليل iPhone / iOS",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (isDarkTheme) AuthGold else AuthMidGreen,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        TextButton(
+                            onClick = { showWindowsGuideDialog = true },
+                            modifier = Modifier.testTag("windows_guide_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MonitorHeart,
+                                contentDescription = null,
+                                tint = if (isDarkTheme) AuthGold else AuthMidGreen,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = "نسخة الكمبيوتر (Windows)",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (isDarkTheme) AuthGold else AuthMidGreen,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    if (showWindowsGuideDialog) {
+        val windowsPortalInfo = "لتشغيل منصة Elghaliz Medicine على نظام Windows (كمبيوتر / لابتوب) بنفس الحساب وبكامل ميزات حفظ الجلسة والمشاهدة أوفلاين:\n" +
+            "1. عبر تطبيق سطح المكتب (Chrome / Edge PWA): افتح رابط المنصة في متصفح Chrome أو Edge على ويندوز ثم اضغط على أيقونة (تثبيت التطبيق Install Elghaliz Medicine) في شريط العنوان لتثبيته كبرنامج مستقل على سطح المكتب.\n" +
+            "2. عبر مشغل تطبيقات أندرويد على ويندوز (Windows Subsystem for Android أو LDPlayer / BlueStacks): ثبّت ملف الـ APK مباشرة، وعند صدور أي تحديث ثبّته فوق النسخة الحالية مباشرة دون حذف التطبيق للاحتفاظ بجلستك وجميع المحاضرات المحملة (.elgdrm)."
+        ElghalizModalDialog(
+            onDismissRequest = {
+                showWindowsGuideDialog = false
+                copiedFeedback = false
+            },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.MonitorHeart,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "تشغيل المنصة على الكمبيوتر (Windows)",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "تعمل منصة Elghaliz Medicine على أجهزة الكمبيوتر واللابتوب (Windows 10 / 11) مع حفظ الجلسة تلقائياً بدون الحاجة لإعادة تسجيل الدخول عند انقطاع الإنترنت:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "1. التشغيل المباشر كتطبيق ويندوز (PWA): افتح المنصة عبر متصفح Microsoft Edge أو Google Chrome ثم اضغط على (تثبيت كبرنامج سطح مكتب - Install App) من شريط العنوان.",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "2. تشغيل ملف الـ APK على ويندوز: يمكنك تشغيل نفس ملف APK على ويندوز عبر نظام Windows Subsystem for Android (WSA) أو محاكي أندرويد مع حفظ كامل للمحاضرات المشفرة أوفلاين.",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "3. التحديث بدون حذف (In-Place Update): يتم تثبيت أي تحديث جديد فوق النسخة الحالية مباشرة أو عبر زر التحديث الداخلي دون مسح الجلسة أو الفيديوهات المحملة.",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    if (copiedFeedback) {
+                        Text(
+                            text = "تم نسخ إرشادات تشغيل نسخة الويندوز لمشاركتها مع الطلاب ✓",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        clipboard?.setPrimaryClip(ClipData.newPlainText("Elghaliz Windows Guide", windowsPortalInfo))
+                        copiedFeedback = true
+                    },
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("نسخ إرشادات الويندوز")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showWindowsGuideDialog = false
+                        copiedFeedback = false
+                    }
+                ) {
+                    Text("إغلاق")
+                }
+            }
+        )
     }
 
     if (showIosWebAppGuideDialog) {
@@ -682,14 +808,13 @@ fun signOut(
     onSignOutComplete: () -> Unit
 ) {
     com.example.data.model.SessionPreferences.markExplicitSignOut(context)
+    runCatching { com.google.firebase.Firebase.auth.signOut() }
+    onSignOutComplete()
     scope.launch {
         try {
-            com.google.firebase.Firebase.auth.signOut()
             credentialManager.clearCredentialState(androidx.credentials.ClearCredentialStateRequest())
         } catch (_: Exception) {
             // Ignore credential state clearing exceptions
-        } finally {
-            onSignOutComplete()
         }
     }
 }

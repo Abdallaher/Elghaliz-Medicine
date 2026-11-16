@@ -10,7 +10,8 @@ data class SavedSessionInfo(
     val email: String,
     val displayName: String,
     val roleMode: UserRoleMode,
-    val autoSignInEnabled: Boolean
+    val autoSignInEnabled: Boolean,
+    val uid: String = ""
 )
 
 data class VerifiedAccountState(
@@ -31,6 +32,7 @@ data class TimestampedLectureNote(
 object SessionPreferences {
     private const val PREFS_NAME = "elghaliz_session_prefs"
     private const val PLAYBACK_POSITIONS_PREFS = "elghaliz_lecture_playback_positions"
+    private const val KEY_LAST_UID = "last_uid"
     private const val KEY_LAST_EMAIL = "last_email"
     private const val KEY_LAST_DISPLAY_NAME = "last_display_name"
     private const val KEY_LAST_ROLE = "last_role"
@@ -314,10 +316,14 @@ object SessionPreferences {
         email: String,
         displayName: String,
         roleMode: UserRoleMode,
-        autoSignInEnabled: Boolean = true
+        autoSignInEnabled: Boolean = true,
+        uid: String = ""
     ) {
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
+            if (uid.isNotBlank()) {
+                putString(KEY_LAST_UID, uid.trim())
+            }
             if (email.isNotBlank()) {
                 putString(KEY_LAST_EMAIL, email.trim().lowercase())
             }
@@ -346,16 +352,18 @@ object SessionPreferences {
 
     fun getSavedSession(context: Context): SavedSessionInfo {
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val uid = prefs.getString(KEY_LAST_UID, "") ?: ""
         val email = prefs.getString(KEY_LAST_EMAIL, "") ?: ""
         val displayName = prefs.getString(KEY_LAST_DISPLAY_NAME, "") ?: ""
-        val roleStr = prefs.getString(KEY_LAST_ROLE, UserRoleMode.ADMIN.name) ?: UserRoleMode.ADMIN.name
-        val role = runCatching { UserRoleMode.valueOf(roleStr) }.getOrDefault(UserRoleMode.ADMIN)
+        val roleStr = prefs.getString(KEY_LAST_ROLE, UserRoleMode.STUDENT.name) ?: UserRoleMode.STUDENT.name
+        val role = runCatching { UserRoleMode.valueOf(roleStr) }.getOrDefault(UserRoleMode.STUDENT)
         val autoSignIn = prefs.getBoolean(KEY_AUTO_SIGN_IN, true)
         return SavedSessionInfo(
             email = email,
             displayName = displayName,
             roleMode = role,
-            autoSignInEnabled = autoSignIn
+            autoSignInEnabled = autoSignIn,
+            uid = uid
         )
     }
 
@@ -367,11 +375,12 @@ object SessionPreferences {
         isPrimaryAdmin: Boolean,
         approvalStatus: String
     ) {
-        if (uid.isBlank()) return
+        if (uid.isBlank() && email.isBlank()) return
+        val cleanUid = uid.trim()
         val cleanEmail = email.trim().lowercase()
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val json = JSONObject().apply {
-            put("uid", uid)
+            put("uid", cleanUid)
             put("email", cleanEmail)
             put("isVerifiedAdmin", isVerifiedAdmin)
             put("isPrimaryAdmin", isPrimaryAdmin)
@@ -379,9 +388,18 @@ object SessionPreferences {
             put("updatedAt", System.currentTimeMillis())
         }
         val encryptedPayload = encryptSensitivePref(context, json.toString())
-        prefs.edit()
-            .putString("verified_account_$uid", encryptedPayload)
-            .apply()
+        prefs.edit().apply {
+            if (cleanUid.isNotBlank()) {
+                putString("verified_account_$cleanUid", encryptedPayload)
+                putString(KEY_LAST_UID, cleanUid)
+            }
+            if (cleanEmail.isNotBlank()) {
+                putString("verified_account_email_$cleanEmail", encryptedPayload)
+                putString(KEY_LAST_EMAIL, cleanEmail)
+            }
+            putBoolean(KEY_AUTO_SIGN_IN, true)
+            apply()
+        }
     }
 
     fun saveLastKnownDriveToken(context: Context, token: String, folderId: String = "") {
@@ -406,22 +424,24 @@ object SessionPreferences {
         uid: String,
         email: String
     ): VerifiedAccountState? {
-        if (uid.isBlank()) return null
+        val cleanUid = uid.trim()
+        val cleanEmail = email.trim().lowercase()
+        if (cleanUid.isBlank() && cleanEmail.isBlank()) return null
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString("verified_account_$uid", null) ?: return null
+        val rawByUid = if (cleanUid.isNotBlank()) prefs.getString("verified_account_$cleanUid", null) else null
+        val rawByEmail = if (cleanEmail.isNotBlank()) prefs.getString("verified_account_email_$cleanEmail", null) else null
+        val raw = rawByUid ?: rawByEmail ?: return null
         val decryptedJson = decryptSensitivePref(context, raw) ?: return null
         return runCatching {
             val json = JSONObject(decryptedJson)
-            val savedUid = json.optString("uid", "")
-            val savedEmail = json.optString("email", "")
-            val cleanEmail = email.trim().lowercase()
-            if (savedUid != uid) return null
+            val savedUid = json.optString("uid", cleanUid)
+            val savedEmail = json.optString("email", cleanEmail)
             if (cleanEmail.isNotBlank() && savedEmail.isNotBlank() && savedEmail != cleanEmail) {
                 return null
             }
             VerifiedAccountState(
-                uid = savedUid,
-                email = savedEmail,
+                uid = savedUid.ifBlank { cleanUid },
+                email = savedEmail.ifBlank { cleanEmail },
                 isVerifiedAdmin = json.optBoolean("isVerifiedAdmin", false),
                 isPrimaryAdmin = json.optBoolean("isPrimaryAdmin", false),
                 approvalStatus = json.optString("approvalStatus", "loading")
@@ -467,34 +487,95 @@ object SessionPreferences {
     }
 
     fun getLocalDownloadsCache(context: Context, uid: String): List<OfflineDownload> {
-        if (uid.isBlank()) return emptyList()
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString("offline_downloads_$uid", null) ?: return emptyList()
-        return runCatching {
-            val arr = JSONArray(raw)
-            val result = mutableListOf<OfflineDownload>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val lecId = obj.optString("lectureId", "")
-                if (lecId.isNotBlank()) {
-                    result.add(
-                        OfflineDownload(
-                            id = obj.optString("id", lecId),
-                            userId = obj.optString("userId", uid),
-                            lectureId = lecId,
-                            title = obj.optString("title", "محاضرة طبية"),
-                            description = obj.optString("description", ""),
-                            categoryName = obj.optString("categoryName", "عام"),
-                            doctorName = obj.optString("doctorName", "د. الغليظ"),
-                            internalFilePath = obj.optString("internalFilePath", ""),
-                            durationSeconds = obj.optLong("durationSeconds", 120L),
-                            fileSizeMb = obj.optLong("fileSizeMb", 1L)
+        val raw = if (uid.isNotBlank()) {
+            prefs.getString("offline_downloads_$uid", null)
+        } else {
+            null
+        } ?: prefs.all.entries.firstOrNull { it.key.startsWith("offline_downloads_") && it.value is String }?.value as? String
+
+        val cachedList = if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(raw)
+                val result = mutableListOf<OfflineDownload>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val lecId = obj.optString("lectureId", "")
+                    if (lecId.isNotBlank()) {
+                        result.add(
+                            OfflineDownload(
+                                id = obj.optString("id", lecId),
+                                userId = obj.optString("userId", uid),
+                                lectureId = lecId,
+                                title = obj.optString("title", "محاضرة طبية"),
+                                description = obj.optString("description", ""),
+                                categoryName = obj.optString("categoryName", "عام"),
+                                doctorName = obj.optString("doctorName", "د. الغليظ"),
+                                internalFilePath = obj.optString("internalFilePath", ""),
+                                durationSeconds = obj.optLong("durationSeconds", 120L),
+                                fileSizeMb = obj.optLong("fileSizeMb", 1L)
+                            )
                         )
+                    }
+                }
+                result
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+
+        // Also scan offline_vault directory for any .elgdrm / .mp4 files on disk so downloaded videos
+        // remain 100% accessible offline even if SharedPreferences was ever reset
+        return runCatching {
+            val vaultDir = File(context.applicationContext.filesDir, "offline_vault")
+            if (!vaultDir.exists()) return@runCatching cachedList
+            val vaultFiles = vaultDir.listFiles { file ->
+                file.isFile && file.length() > 0L &&
+                    (file.name.endsWith(".elgdrm", ignoreCase = true) || file.name.endsWith(".mp4", ignoreCase = true)) &&
+                    !file.name.endsWith(".part", ignoreCase = true)
+            } ?: return@runCatching cachedList
+
+            if (vaultFiles.isEmpty()) return@runCatching cachedList
+
+            val mergedMap = LinkedHashMap<String, OfflineDownload>()
+            cachedList.forEach { mergedMap[it.lectureId] = it }
+
+            val cachedLecturesById = getLocalLecturesCache(context).associateBy { it.id }
+            for (file in vaultFiles.sortedByDescending { it.lastModified() }) {
+                val lectureId = file.name.substringBeforeLast(".")
+                if (lectureId.isNotBlank() && !mergedMap.containsKey(lectureId)) {
+                    val matchedLecture = cachedLecturesById[lectureId]
+                    val sizeMb = (file.length() / (1024L * 1024L)).coerceAtLeast(1L)
+                    mergedMap[lectureId] = OfflineDownload(
+                        id = lectureId,
+                        userId = uid.ifBlank { "offline_student" },
+                        lectureId = lectureId,
+                        title = matchedLecture?.title?.takeIf { it.isNotBlank() } ?: "محاضرة محفوظة ($lectureId)",
+                        description = matchedLecture?.description ?: "محاضرة طبية مشفرة محفوظة للمشاهدة بدون إنترنت",
+                        categoryName = matchedLecture?.categoryName?.takeIf { it.isNotBlank() } ?: "المكتبة المحملة",
+                        doctorName = matchedLecture?.doctorName?.takeIf { it.isNotBlank() } ?: "د. الغليظ",
+                        internalFilePath = file.absolutePath,
+                        durationSeconds = matchedLecture?.durationSeconds ?: 1800L,
+                        fileSizeMb = matchedLecture?.fileSizeMb?.takeIf { it > 0L } ?: sizeMb
                     )
                 }
             }
-            result
-        }.getOrDefault(emptyList())
+            mergedMap.values.toList()
+        }.getOrDefault(cachedList)
+    }
+
+    fun hasOfflineStudentWorkspaceData(context: Context, uid: String): Boolean {
+        return runCatching {
+            val vaultDir = File(context.applicationContext.filesDir, "offline_vault")
+            val hasVaultFiles = vaultDir.exists() && (vaultDir.listFiles()?.any {
+                it.isFile && it.length() > 0L && (it.name.endsWith(".elgdrm") || it.name.endsWith(".mp4"))
+            } == true)
+            if (hasVaultFiles) return@runCatching true
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val hasCachedLectures = !prefs.getString("cached_lectures", null).isNullOrBlank()
+            val hasCachedDownloads = !prefs.getString("offline_downloads_$uid", null).isNullOrBlank()
+            hasCachedLectures || hasCachedDownloads
+        }.getOrDefault(false)
     }
 
     fun saveLocalCategoriesCache(context: Context, categories: List<Category>) {
@@ -622,41 +703,70 @@ object SessionPreferences {
     }
 
     fun getLocalCourseRequestsCache(context: Context, uid: String): List<CourseRequest> {
-        if (uid.isBlank()) return emptyList()
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString("cached_course_reqs_$uid", null) ?: return emptyList()
-        return runCatching {
-            val arr = JSONArray(raw)
-            val list = mutableListOf<CourseRequest>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val catId = obj.optString("categoryId", "")
-                if (catId.isNotBlank()) {
-                    list.add(
-                        CourseRequest(
-                            id = obj.optString("id", "${uid}_$catId"),
-                            userId = obj.optString("userId", uid),
-                            studentEmail = obj.optString("studentEmail", ""),
-                            studentName = obj.optString("studentName", ""),
-                            categoryId = catId,
-                            categoryName = obj.optString("categoryName", ""),
-                            status = obj.optString("status", "pending"),
-                            scopeKey = obj.optString("scopeKey", "global")
+        val raw = if (uid.isNotBlank()) {
+            prefs.getString("cached_course_reqs_$uid", null)
+        } else {
+            null
+        } ?: prefs.all.entries.firstOrNull { it.key.startsWith("cached_course_reqs_") && it.value is String }?.value as? String
+
+        val cached = if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(raw)
+                val list = mutableListOf<CourseRequest>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val catId = obj.optString("categoryId", "")
+                    if (catId.isNotBlank()) {
+                        list.add(
+                            CourseRequest(
+                                id = obj.optString("id", "${uid}_$catId"),
+                                userId = obj.optString("userId", uid),
+                                studentEmail = obj.optString("studentEmail", ""),
+                                studentName = obj.optString("studentName", ""),
+                                categoryId = catId,
+                                categoryName = obj.optString("categoryName", ""),
+                                status = obj.optString("status", "pending"),
+                                scopeKey = obj.optString("scopeKey", "global")
+                            )
                         )
-                    )
+                    }
+                }
+                list
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+
+        // Ensure any category that has a downloaded lecture on disk is marked approved offline
+        return runCatching {
+            val byCatId = LinkedHashMap<String, CourseRequest>()
+            cached.forEach { byCatId[it.categoryId] = it }
+            val downloadedIds = getLocalDownloadsCache(context, uid).map { it.lectureId }.toSet()
+            if (downloadedIds.isNotEmpty()) {
+                val lectures = getLocalLecturesCache(context)
+                for (lec in lectures) {
+                    if (downloadedIds.contains(lec.id) && lec.categoryId.isNotBlank() && !byCatId.containsKey(lec.categoryId)) {
+                        byCatId[lec.categoryId] = CourseRequest(
+                            id = "${uid}_${lec.categoryId}",
+                            userId = uid,
+                            studentEmail = "",
+                            studentName = "",
+                            categoryId = lec.categoryId,
+                            categoryName = lec.categoryName,
+                            status = "approved",
+                            scopeKey = "global"
+                        )
+                    }
                 }
             }
-            list
-        }.getOrDefault(emptyList())
+            byCatId.values.toList()
+        }.getOrDefault(cached)
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun cleanDemoSessionExceptPrimaryAdmin(context: Context, primaryAdminEmail: String = "abdallahxh909@gmail.com") {
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val savedEmail = prefs.getString(KEY_LAST_EMAIL, "")?.trim()?.lowercase().orEmpty()
-        val isPrimary = savedEmail == primaryAdminEmail.trim().lowercase()
-        if (!isPrimary && savedEmail.isNotBlank()) {
-            prefs.edit().clear().apply()
-        }
+        // Preserves student and admin sessions across app restarts and offline launches.
     }
 
     fun wipeAllData(context: Context) {

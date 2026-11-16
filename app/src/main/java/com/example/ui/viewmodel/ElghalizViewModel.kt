@@ -81,8 +81,14 @@ class ElghalizViewModel(
     } else {
         null
     }
-    private val hasPreVerifiedOfflineAccess = initialCachedVerification != null &&
-        (initialCachedVerification.isVerifiedAdmin || initialCachedVerification.approvalStatus == "approved")
+    private val hasOfflineWorkspaceData = if (appContext != null && !isRobolectricRuntime) {
+        SessionPreferences.hasOfflineStudentWorkspaceData(appContext, currentUserId)
+    } else {
+        false
+    }
+    private val hasPreVerifiedOfflineAccess = (initialCachedVerification != null &&
+        (initialCachedVerification.isVerifiedAdmin || initialCachedVerification.approvalStatus == "approved")) ||
+        hasOfflineWorkspaceData
 
     private val _activeRole = MutableStateFlow(
         if (initialRoleChoice == UserRoleMode.ADMIN && initialCachedVerification?.isVerifiedAdmin == true) {
@@ -253,18 +259,35 @@ class ElghalizViewModel(
     private val _isSignedOut = MutableStateFlow(false)
 
     private val canAccessProtectedContent = combine(_isVerifiedAdmin, _studentApprovalStatus, _isSignedOut) { isAdmin, status, signedOut ->
-        !signedOut && Firebase.auth.currentUser != null && (isAdmin || status == "approved")
+        !signedOut &&
+            (Firebase.auth.currentUser != null || (!isRobolectricRuntime && currentUserId.isNotBlank())) &&
+            (isAdmin || status == "approved")
     }
 
     val categoriesState: StateFlow<UiState<List<Category>>> = canAccessProtectedContent
         .flatMapLatest { allowed ->
-            if (!allowed || Firebase.auth.currentUser == null) {
+            if (!allowed) {
                 flowOf(UiState.Success(emptyList()))
+            } else if (Firebase.auth.currentUser == null) {
+                val cached = if (appContext != null && !isRobolectricRuntime) {
+                    SessionPreferences.getLocalCategoriesCache(appContext)
+                } else {
+                    emptyList()
+                }
+                flowOf(UiState.Success(cached))
             } else {
                 repository.observeCategories()
                     .map<List<Category>, UiState<List<Category>>> { list ->
                         if (appContext != null && !isRobolectricRuntime && list.isNotEmpty()) {
                             SessionPreferences.saveLocalCategoriesCache(appContext, list)
+                            SessionPreferences.saveVerifiedAccountState(
+                                context = appContext,
+                                uid = currentUserId,
+                                email = currentUserEmail,
+                                isVerifiedAdmin = _isVerifiedAdmin.value,
+                                isPrimaryAdmin = _isPrimaryAdmin.value,
+                                approvalStatus = "approved"
+                            )
                         }
                         val effectiveList = if (list.isEmpty() && appContext != null && !isRobolectricRuntime) {
                             SessionPreferences.getLocalCategoriesCache(appContext)
@@ -303,18 +326,38 @@ class ElghalizViewModel(
         _locallyDeletedLectureIds
     ) { allowed, deletedIds -> allowed to deletedIds }
         .flatMapLatest { (allowed, deletedIds) ->
-            if (!allowed || Firebase.auth.currentUser == null) {
+            if (!allowed) {
                 flowOf(UiState.Success(emptyList()))
+            } else if (Firebase.auth.currentUser == null) {
+                val cached = if (appContext != null && !isRobolectricRuntime) {
+                    SessionPreferences.getLocalLecturesCache(appContext).filterNot { deletedIds.contains(it.id) }
+                } else {
+                    emptyList()
+                }
+                flowOf(UiState.Success(cached))
             } else {
                 repository.observeLectures()
                     .map<List<Lecture>, UiState<List<Lecture>>> { list ->
-                        val effectiveList = if (deletedIds.isEmpty()) {
+                        val filtered = if (deletedIds.isEmpty()) {
                             list
                         } else {
                             list.filterNot { deletedIds.contains(it.id) }
                         }
-                        if (appContext != null && !isRobolectricRuntime) {
-                            SessionPreferences.saveLocalLecturesCache(appContext, effectiveList)
+                        val effectiveList = if (filtered.isEmpty() && deletedIds.isEmpty() && appContext != null && !isRobolectricRuntime) {
+                            SessionPreferences.getLocalLecturesCache(appContext)
+                        } else {
+                            if (appContext != null && !isRobolectricRuntime) {
+                                SessionPreferences.saveLocalLecturesCache(appContext, filtered)
+                                SessionPreferences.saveVerifiedAccountState(
+                                    context = appContext,
+                                    uid = currentUserId,
+                                    email = currentUserEmail,
+                                    isVerifiedAdmin = _isVerifiedAdmin.value,
+                                    isPrimaryAdmin = _isPrimaryAdmin.value,
+                                    approvalStatus = "approved"
+                                )
+                            }
+                            filtered
                         }
                         UiState.Success(effectiveList)
                     }
@@ -395,8 +438,15 @@ class ElghalizViewModel(
 
     val downloadsState: StateFlow<UiState<List<OfflineDownload>>> = canAccessProtectedContent
         .flatMapLatest { allowed ->
-            if (!allowed || Firebase.auth.currentUser == null) {
+            if (!allowed) {
                 flowOf(UiState.Success(emptyList()))
+            } else if (Firebase.auth.currentUser == null) {
+                val cached = if (appContext != null && !isRobolectricRuntime) {
+                    SessionPreferences.getLocalDownloadsCache(appContext, currentUserId)
+                } else {
+                    emptyList()
+                }
+                flowOf(UiState.Success(cached))
             } else {
                 repository.observeUserDownloads()
                     .map<List<OfflineDownload>, UiState<List<OfflineDownload>>> { UiState.Success(it) }
@@ -490,12 +540,22 @@ class ElghalizViewModel(
                 initializeStudentApprovalFlow()
             }
         } else {
+            if (hasPreVerifiedOfflineAccess) {
+                _studentApprovalStatus.value = "approved"
+            }
             _isCheckingRole.value = false
         }
     }
 
     fun initializeStudentApprovalFlow() {
-        if (Firebase.auth.currentUser == null || _isSignedOut.value) {
+        if (_isSignedOut.value) {
+            _isCheckingRole.value = false
+            return
+        }
+        if (Firebase.auth.currentUser == null) {
+            if (hasPreVerifiedOfflineAccess) {
+                _studentApprovalStatus.value = "approved"
+            }
             _isCheckingRole.value = false
             return
         }
@@ -505,8 +565,8 @@ class ElghalizViewModel(
             } else {
                 null
             }
-            val alreadyVerifiedOffline = cachedState != null &&
-                (cachedState.approvalStatus == "approved" || cachedState.isVerifiedAdmin)
+            val alreadyVerifiedOffline = hasPreVerifiedOfflineAccess ||
+                (cachedState != null && (cachedState.approvalStatus == "approved" || cachedState.isVerifiedAdmin))
 
             if (alreadyVerifiedOffline) {
                 _studentApprovalStatus.value = "approved"
